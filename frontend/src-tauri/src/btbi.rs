@@ -122,21 +122,20 @@ pub async fn enqueue(folder: &Path, meeting_id: &str, _transcript: Value) -> Res
     if !folder.join("recorder.json").exists() {
         return Ok(());
     }
-    let v: Value = serde_json::from_reader(std::fs::File::open(folder.join("recorder.json"))?)?;
-    let p: Profile = serde_json::from_value(v["profile"].clone())?;
-    let dest: Destination = serde_json::from_value(v["destination"].clone())?;
-    let transcript: Value = serde_json::from_reader(std::fs::File::open(
-        folder.join("canonical-transcript.json"),
-    )?)?;
-    Queue::new(root()?.join("queue"))?.enqueue(
-        folder,
-        meeting_id,
-        &p.id,
-        &p.name,
-        dest,
-        &transcript,
-    )?;
-    notice("Meeting queued for SharePoint");
+    let folder = folder.to_path_buf();
+    let meeting_id = meeting_id.to_string();
+    let queue_root = root()?.join("queue");
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let v: Value = serde_json::from_reader(std::fs::File::open(folder.join("recorder.json"))?)?;
+        let p: Profile = serde_json::from_value(v["profile"].clone())?;
+        let dest: Destination = serde_json::from_value(v["destination"].clone())?;
+        let transcript: Value = serde_json::from_reader(std::fs::File::open(
+            folder.join("canonical-transcript.json"),
+        )?)?;
+        Queue::new(queue_root)?.enqueue(&folder, &meeting_id, &p.id, &p.name, dest, &transcript)?;
+        Ok(())
+    })
+    .await??;
     Ok(())
 }
 async fn access(s: &Settings) -> Result<String> {
@@ -252,6 +251,9 @@ pub async fn btbi_configure(destination: Destination, enabled: bool) -> Result<(
 }
 #[tauri::command]
 pub async fn btbi_begin_signin() -> Result<Value, String> {
+    if crate::audio::recording_commands::is_recording().await {
+        return Err("Stop recording before changing the Microsoft account".into());
+    }
     use std::sync::atomic::Ordering;
     if SIGNING_IN.swap(true, Ordering::SeqCst) {
         return Err("Sign-in already in progress".into());

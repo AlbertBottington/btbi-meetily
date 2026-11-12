@@ -968,7 +968,6 @@ pub async fn api_save_transcript<R: Runtime>(
         auth_token.is_some()
     );
 
-    let btbi_transcript = serde_json::json!({"meeting_title":meeting_title,"segments":transcripts});
     let btbi_folder = folder_path.clone();
 
     // Convert serde_json::Value to TranscriptSegment
@@ -999,7 +998,7 @@ pub async fn api_save_transcript<R: Runtime>(
                 meeting_id
             );
             let upload_error = if let Some(folder) = btbi_folder {
-                crate::btbi::enqueue(std::path::Path::new(&folder), &meeting_id, btbi_transcript).await.err().map(|e|e.to_string())
+                crate::btbi::enqueue(std::path::Path::new(&folder), &meeting_id, serde_json::Value::Null).await.err().map(|e|e.to_string())
             } else { None };
             Ok(serde_json::json!({
                 "upload_error":upload_error,

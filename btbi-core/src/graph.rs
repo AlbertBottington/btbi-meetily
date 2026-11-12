@@ -253,7 +253,10 @@ impl Graph {
             m.recorder_id == recorder,
             "Sign in as the original recorder to upload this capture"
         );
-        Queue::verify(folder, &m)?;
+        let verified_folder = folder.to_path_buf();
+        let verified_manifest = m.clone();
+        tokio::task::spawn_blocking(move || Queue::verify(&verified_folder, &verified_manifest))
+            .await??;
         let mut state = Queue::state(folder)?;
         if state.status == "Uploaded" {
             return Ok(());
@@ -458,6 +461,7 @@ mod transport_tests {
         files: HashMap<String, Vec<u8>>,
         partial: HashMap<String, Vec<u8>>,
         throttled: bool,
+        expire_next: bool,
         auth_leaked: bool,
         folders: usize,
     }
@@ -520,7 +524,13 @@ mod transport_tests {
                         body = remote.files[path.trim_start_matches("/download/")].clone();
                     } else if path.starts_with("/transfer/") {
                         let name = path.trim_start_matches("/transfer/").to_string();
-                        if method == "GET" {
+                        if method == "GET" && remote.expire_next {
+                            remote.expire_next = false;
+                            remote.offsets.remove(&name);
+                            remote.partial.remove(&name);
+                            code = 404;
+                            body = b"{}".to_vec();
+                        } else if method == "GET" {
                             body=json!({"nextExpectedRanges":[format!("{}-",remote.offsets.get(&name).copied().unwrap_or(0))]}).to_string().into_bytes();
                         } else if name == "audio.dat"
                             && remote.offsets.get(&name).copied().unwrap_or(0) > 0
@@ -576,8 +586,7 @@ mod transport_tests {
         });
         (base, state, job)
     }
-    #[tokio::test]
-    async fn resumes_after_throttle_and_reconciles_lost_commit_receipt() {
+    async fn exercise_restart(expire: bool) {
         let (base, remote, server) = mock().await;
         let d = tempfile::tempdir().unwrap();
         let data = vec![42u8; 10 * 1024 * 1024 + 320 * 1024];
@@ -618,6 +627,7 @@ mod transport_tests {
         assert_eq!(error.downcast_ref::<RetryDelay>().unwrap().0, 1);
         assert_eq!(Queue::state(d.path()).unwrap().offset, 10 * 1024 * 1024);
         assert!(!remote.lock().unwrap().files.contains_key("manifest.json"));
+        remote.lock().unwrap().expire_next = expire;
         // New Graph instance and on-disk state emulate process restart.
         let restarted = Graph {
             client: client().unwrap(),
@@ -632,11 +642,31 @@ mod transport_tests {
         lost.file_index = 0;
         Queue::save_state(d.path(), &lost).unwrap();
         restarted.upload(d.path(), "person").await.unwrap();
-        let r = remote.lock().unwrap();
-        assert_eq!(r.files["audio.dat"], data);
-        assert_eq!(r.files.len(), 2);
-        assert_eq!(r.folders, 1);
-        assert!(!r.auth_leaked);
+        {
+            let mut r = remote.lock().unwrap();
+            assert_eq!(r.files["audio.dat"], data);
+            assert_eq!(r.files.len(), 2);
+            assert_eq!(r.folders, 1);
+            assert!(!r.auth_leaked);
+            r.files.get_mut("audio.dat").unwrap()[0] = 99;
+        }
+        Queue::save_state(d.path(), &lost).unwrap();
+        assert!(restarted
+            .upload(d.path(), "person")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Remote file conflict"));
+        assert_ne!(Queue::state(d.path()).unwrap().status, "Uploaded");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn resumes_after_throttle_and_reconciles_lost_commit_receipt() {
+        exercise_restart(false).await;
+    }
+    #[tokio::test]
+    async fn recreates_expired_session_without_duplicate_capture() {
+        exercise_restart(true).await;
     }
 }

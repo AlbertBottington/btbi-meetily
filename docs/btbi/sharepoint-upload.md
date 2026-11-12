@@ -71,3 +71,24 @@ btbi-core/Cargo.toml`. Full app compilation, Windows installer and live recordin
 SharePoint tests are separate acceptance claims. Mock/unit success is not live
 upload proof. No speaker training, cross-capture merge, or email processing is
 included.
+
+## Implementation verification (2026-11-12)
+
+- macOS core: 12 tests passed, including real local HTTP transfers with throttling,
+  resume after restart, expired-session recreation, lost-commit reconciliation,
+  conflict detection and no bearer token on preauthenticated transfer URLs.
+  These are synthetic mock-server tests, not Microsoft tenant acceptance.
+- Frontend TypeScript check and production static build passed.
+- Source-only native Rust check passed with `DOCS_RS=1` (cidre native build skipped)
+  and `TAURI_CONFIG` excluding bundled resources/sidecars. This verifies Rust types,
+  not native linking, an executable, audio capture, or packaging. The normal Mac
+  build cannot proceed without full Xcode.
+- Initial Windows core run found a read-only file handle could not be flushed.
+  Snapshots now open copied files for writing before flushing. Windows retest and
+  the installer pipeline remain pending; the native final-window regression test
+  is included in that pipeline.
+- Live tenant consent, account sign-in, SharePoint delivery, Windows native UI,
+  actual devices, and pilot acceptance above remain unverified.
+
+Protocol references: [resumable uploads](https://learn.microsoft.com/en-us/graph/api/driveitem-createuploadsession?view=graph-rest-1.0)
+and [device authorization](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-device-code).
