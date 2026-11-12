@@ -24,4 +24,4 @@ pub use worker::{
     TranscriptUpdate
 };
 
-pub use worker::{BTBI_TRANSCRIPTION_FAILED, BTBI_SEGMENTS};
+pub use worker::{BTBI_TRANSCRIPT};

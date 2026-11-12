@@ -74,18 +74,19 @@ included.
 
 ## Implementation verification (2026-11-12)
 
-- macOS core: 12 tests passed, including real local HTTP transfers with throttling,
+- macOS core: 13 tests passed, including real local HTTP transfers with throttling,
   resume after restart, expired-session recreation, lost-commit reconciliation,
   conflict detection and no bearer token on preauthenticated transfer URLs.
+  A separate regression rejects late transcript results from prior sessions.
   These are synthetic mock-server tests, not Microsoft tenant acceptance.
 - Frontend TypeScript check and production static build passed.
-- Source-only native Rust check passed with `DOCS_RS=1` (cidre native build skipped)
+- Source-only native Rust library and test-target checks passed with `DOCS_RS=1` (cidre native build skipped)
   and `TAURI_CONFIG` excluding bundled resources/sidecars. This verifies Rust types,
   not native linking, an executable, audio capture, or packaging. The normal Mac
   build cannot proceed without full Xcode.
 - Initial Windows core run found a read-only file handle could not be flushed.
-  Snapshots now open copied files for writing before flushing. Windows retest and
-  the installer pipeline remain pending; the native final-window regression test
+  Snapshots now open copied files for writing before flushing. Windows core retest passed at ed90ac4 (12 tests); the current head adds session
+  isolation and needs a fresh Windows run. The installer pipeline remains pending; the native final-window regression test
   is included in that pipeline.
 - Live tenant consent, account sign-in, SharePoint delivery, Windows native UI,
   actual devices, and pilot acceptance above remain unverified.

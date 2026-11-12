@@ -587,8 +587,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     drop(engine_lifecycle_guard);
 
     // Start optimized parallel transcription task and store handle
-    transcription::BTBI_TRANSCRIPTION_FAILED.store(false, Ordering::SeqCst);
-    transcription::BTBI_SEGMENTS.lock().map_err(|_| "Transcript collector unavailable")?.clear();
+    transcription::BTBI_TRANSCRIPT.lock().map_err(|_| "Transcript collector unavailable")?.begin();
     let task_handle = transcription::start_transcription_task(app.clone(), transcription_receiver);
     {
         let mut global_task = TRANSCRIPTION_TASK.lock().unwrap();
@@ -807,8 +806,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     drop(engine_lifecycle_guard);
 
     // Start optimized parallel transcription task and store handle
-    transcription::BTBI_TRANSCRIPTION_FAILED.store(false, Ordering::SeqCst);
-    transcription::BTBI_SEGMENTS.lock().map_err(|_| "Transcript collector unavailable")?.clear();
+    transcription::BTBI_TRANSCRIPT.lock().map_err(|_| "Transcript collector unavailable")?.begin();
     let task_handle = transcription::start_transcription_task(app.clone(), transcription_receiver);
     {
         let mut global_task = TRANSCRIPTION_TASK.lock().unwrap();
@@ -1002,7 +1000,7 @@ async fn stop_recording_for_session<R: Runtime>(
             &mut task_handle
         ).await {
             Ok(Ok(())) => {
-                btbi_transcription_complete = !transcription::BTBI_TRANSCRIPTION_FAILED.load(Ordering::SeqCst);
+                btbi_transcription_complete = transcription::BTBI_TRANSCRIPT.lock().map(|c| !c.failed).unwrap_or(false);
                 info!("Transcription workers drained");
             }
             Ok(Err(e)) => {
@@ -1240,7 +1238,7 @@ async fn stop_recording_for_session<R: Runtime>(
                 if btbi_transcription_complete {
                     if let Some(ref folder) = meeting_folder {
                         if folder.join("sources-complete.json").is_file() {
-                            let segments = transcription::BTBI_SEGMENTS.lock().map(|s|s.clone());
+                            let segments = transcription::BTBI_TRANSCRIPT.lock().map(|c|c.segments.clone());
                             let canonical = segments.and_then(|mut segments| {
                                 segments.sort_by(|a,b|a["audio_start_time"].as_f64().unwrap_or(0.0).total_cmp(&b["audio_start_time"].as_f64().unwrap_or(0.0)));
                                 Ok(serde_json::json!({"version":1,"segments":segments}))
