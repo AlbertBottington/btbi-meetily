@@ -1,3 +1,5 @@
+pub static BTBI_SEGMENTS: std::sync::Mutex<Vec<serde_json::Value>> = std::sync::Mutex::new(Vec::new());
+pub static BTBI_TRANSCRIPTION_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 // audio/transcription/worker.rs
 //
 // Parallel transcription worker pool and chunk processing logic.
@@ -62,6 +64,7 @@ enum WorkerFailureCategory {
 
 impl WorkerLogStats {
     fn record_failure(&mut self, category: WorkerFailureCategory) {
+        BTBI_TRANSCRIPTION_FAILED.store(true, Ordering::SeqCst);
         self.failed += 1;
         match category {
             WorkerFailureCategory::ModelNotLoaded => self.model_not_loaded_failures += 1,
@@ -188,6 +191,7 @@ pub fn start_transcription_task<R: Runtime>(
         let transcription_engine = match super::engine::get_or_init_transcription_engine(&app).await {
             Ok(engine) => engine,
             Err(e) => {
+                BTBI_TRANSCRIPTION_FAILED.store(true, Ordering::SeqCst);
                 error!("Failed to initialize transcription engine");
                 let _ = app.emit("transcription-error", serde_json::json!({
                     "error": e,
@@ -282,6 +286,9 @@ pub fn start_transcription_task<R: Runtime>(
                                         duration: chunk_duration,
                                     };
 
+                                    if let Ok(mut segments) = BTBI_SEGMENTS.lock() {
+                                        segments.push(serde_json::to_value(&update).expect("serializable transcript"));
+                                    } else { BTBI_TRANSCRIPTION_FAILED.store(true, Ordering::SeqCst); }
                                     if app_clone.emit("transcript-update", &update).is_ok() {
                                         stats.emitted += 1;
                                         #[cfg(debug_assertions)]
@@ -363,6 +370,7 @@ pub fn start_transcription_task<R: Runtime>(
 
         for handle in worker_handles {
             if handle.await.is_err() {
+                BTBI_TRANSCRIPTION_FAILED.store(true, Ordering::SeqCst);
                 error!("Transcription worker panicked");
             }
         }
@@ -378,6 +386,7 @@ pub fn start_transcription_task<R: Runtime>(
         let final_queued = chunks_queued.load(Ordering::SeqCst);
         let final_completed = chunks_completed.load(Ordering::SeqCst);
         if final_queued != final_completed {
+            BTBI_TRANSCRIPTION_FAILED.store(true, Ordering::SeqCst);
             error!(
                 "Transcription chunk loss detected queued={} completed={}",
                 final_queued, final_completed

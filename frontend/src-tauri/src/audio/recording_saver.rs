@@ -28,6 +28,8 @@ pub struct TranscriptSegment {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MeetingMetadata {
     pub version: String,
+    #[serde(default)]
+    pub capture_id: String,
     pub meeting_id: Option<String>,
     pub meeting_name: Option<String>,
     pub created_at: String,
@@ -54,6 +56,7 @@ pub struct RecordingSaver {
     metadata: Option<MeetingMetadata>,
     transcript_segments: Arc<Mutex<Vec<TranscriptSegment>>>,
     is_saving: Arc<Mutex<bool>>,
+    accumulation: Option<tokio::task::JoinHandle<Result<(), String>>>,
 }
 
 impl RecordingSaver {
@@ -65,6 +68,7 @@ impl RecordingSaver {
             metadata: None,
             transcript_segments: Arc::new(Mutex::new(Vec::new())),
             is_saving: Arc::new(Mutex::new(false)),
+            accumulation: None,
         }
     }
 
@@ -171,44 +175,18 @@ impl RecordingSaver {
         }
 
         // Start accumulation task
-        let is_saving_clone = self.is_saving.clone();
         let incremental_saver_arc = self.incremental_saver.clone();
         let save_audio = auto_save;
 
-        tokio::spawn(async move {
-            info!("Recording saver accumulation task started (save_audio: {})", save_audio);
-
+        self.accumulation = Some(tokio::spawn(async move {
             while let Some(chunk) = receiver.recv().await {
-                // Check if we should continue
-                let should_continue = if let Ok(is_saving) = is_saving_clone.lock() {
-                    *is_saving
-                } else {
-                    false
-                };
-
-                if !should_continue {
-                    break;
-                }
-
-                // Only process audio chunks if auto_save is enabled
                 if save_audio {
-                    // Add chunk to incremental saver
-                    if let Some(saver_arc) = &incremental_saver_arc {
-                        let mut saver_guard = saver_arc.lock().await;
-                        if saver_guard.add_chunk(chunk).is_err() {
-                            error!("Failed to add chunk to incremental saver");
-                        }
-                    } else {
-                        error!("Incremental saver not available while accumulating");
-                    }
-                } else {
-                    // auto_save is false: discard audio chunk (no-op)
-                    // Transcription already happened in the pipeline before this point
+                    let saver = incremental_saver_arc.as_ref().ok_or("Audio saver unavailable")?;
+                    saver.lock().await.add_chunk(chunk).map_err(|_| "Audio checkpoint failed")?;
                 }
             }
-
-            info!("Recording saver accumulation task ended");
-        });
+            Ok(())
+        }));
 
         // Set saving flag
         if let Ok(mut is_saving) = self.is_saving.lock() {
@@ -240,6 +218,7 @@ impl RecordingSaver {
         // Create initial metadata
         let metadata = MeetingMetadata {
             version: "1.0".to_string(),
+            capture_id: uuid::Uuid::new_v4().to_string(),
             meeting_id: None,  // Will be set by backend
             meeting_name: Some(meeting_name.to_string()),
             created_at: chrono::Utc::now().to_rfc3339(),
@@ -355,13 +334,13 @@ impl RecordingSaver {
     ) -> Result<Option<String>, String> {
         info!("Stopping recording saver");
 
-        // Stop accumulation
-        if let Ok(mut is_saving) = self.is_saving.lock() {
-            *is_saving = false;
+        // Drain every queued mixed chunk after the pipeline sender has closed.
+        if let Some(mut task) = self.accumulation.take() {
+            match tokio::time::timeout(std::time::Duration::from_secs(120), &mut task).await {
+                Ok(result) => result.map_err(|_| "Audio saver task failed")??,
+                Err(_) => { task.abort(); return Err("Audio saver did not finish".into()); }
+            }
         }
-
-        // Give time for final chunks
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
         // Check if incremental saver exists (indicates auto_save was enabled)
         let should_save_audio = self.incremental_saver.is_some();

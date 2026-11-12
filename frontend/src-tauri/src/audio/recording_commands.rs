@@ -561,6 +561,10 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
             let _ = app.emit("mic-device-switched", serde_json::json!({"device_name": active.name, "device_label": super::devices::device_label(&active.name)}));
         }
     }
+    if let Err(e) = crate::btbi::stamp_recorder(manager.get_meeting_folder()) {
+        manager.cleanup_without_save().await;
+        return Err(e.to_string());
+    }
     // Take the device event receiver BEFORE storing manager globally.
     // A background task will process device events (hot-swap) without frontend polling.
     let device_event_receiver = manager.take_device_event_receiver();
@@ -583,6 +587,8 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     drop(engine_lifecycle_guard);
 
     // Start optimized parallel transcription task and store handle
+    transcription::BTBI_TRANSCRIPTION_FAILED.store(false, Ordering::SeqCst);
+    transcription::BTBI_SEGMENTS.lock().map_err(|_| "Transcript collector unavailable")?.clear();
     let task_handle = transcription::start_transcription_task(app.clone(), transcription_receiver);
     {
         let mut global_task = TRANSCRIPTION_TASK.lock().unwrap();
@@ -775,6 +781,10 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
             let _ = app.emit("mic-device-switched", serde_json::json!({"device_name": active.name, "device_label": super::devices::device_label(&active.name)}));
         }
     }
+    if let Err(e) = crate::btbi::stamp_recorder(manager.get_meeting_folder()) {
+        manager.cleanup_without_save().await;
+        return Err(e.to_string());
+    }
     // Take the device event receiver BEFORE storing manager globally.
     // A background task will process device events (hot-swap) without frontend polling.
     let device_event_receiver = manager.take_device_event_receiver();
@@ -797,6 +807,8 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     drop(engine_lifecycle_guard);
 
     // Start optimized parallel transcription task and store handle
+    transcription::BTBI_TRANSCRIPTION_FAILED.store(false, Ordering::SeqCst);
+    transcription::BTBI_SEGMENTS.lock().map_err(|_| "Transcript collector unavailable")?.clear();
     let task_handle = transcription::start_transcription_task(app.clone(), transcription_receiver);
     {
         let mut global_task = TRANSCRIPTION_TASK.lock().unwrap();
@@ -957,7 +969,8 @@ async fn stop_recording_for_session<R: Runtime>(
         global_task.take()
     };
 
-    if let Some(task_handle) = transcription_task {
+    let mut btbi_transcription_complete = false;
+    if let Some(mut task_handle) = transcription_task {
         info!("⏳ Waiting for ALL transcription chunks to be processed (no timeout - preserving every chunk)");
 
         // Enhanced progress monitoring during shutdown
@@ -986,17 +999,19 @@ async fn stop_recording_for_session<R: Runtime>(
         // Wait up to 10 minutes for transcription completion to prevent indefinite hangs
         match tokio::time::timeout(
             tokio::time::Duration::from_secs(600), // 10 minutes max
-            task_handle
+            &mut task_handle
         ).await {
             Ok(Ok(())) => {
-                info!("✅ ALL transcription chunks processed successfully - no data lost");
+                btbi_transcription_complete = !transcription::BTBI_TRANSCRIPTION_FAILED.load(Ordering::SeqCst);
+                info!("Transcription workers drained");
             }
             Ok(Err(e)) => {
                 warn!("⚠️ Transcription task completed with error: {:?}", e);
                 // Continue anyway - the worker may have processed most chunks
             }
             Err(_) => {
-                warn!("⏱️ Transcription timeout (10 minutes) reached, continuing shutdown to prevent indefinite hang");
+                task_handle.abort();
+                warn!("Transcription timeout; automatic upload blocked");
                 // Continue shutdown even on timeout - better to lose some chunks than hang forever
             }
         }
@@ -1222,6 +1237,25 @@ async fn stop_recording_for_session<R: Runtime>(
             manager.save_recording_only(&app)
         ).await {
             Ok(Ok(_)) => {
+                if btbi_transcription_complete {
+                    if let Some(ref folder) = meeting_folder {
+                        if folder.join("sources-complete.json").is_file() {
+                            let segments = transcription::BTBI_SEGMENTS.lock().map(|s|s.clone());
+                            let canonical = segments.and_then(|mut segments| {
+                                segments.sort_by(|a,b|a["audio_start_time"].as_f64().unwrap_or(0.0).total_cmp(&b["audio_start_time"].as_f64().unwrap_or(0.0)));
+                                Ok(serde_json::json!({"version":1,"segments":segments}))
+                            });
+                            let canonical_saved = canonical.ok().map(|v|btbi_core::queue::atomic_json(&folder.join("canonical-transcript.json"), &v).is_ok()).unwrap_or(false);
+                            if !canonical_saved { warn!("Canonical transcript could not be saved; upload blocked"); }
+
+                            if canonical_saved && btbi_core::queue::atomic_json(&folder.join("capture-ready.json"),
+                                &serde_json::json!({"version":1,"transcription_drained":true,"audio_finalized":true,
+                                    "completed_at":chrono::Utc::now().to_rfc3339()})).is_err() {
+                                warn!("Completion marker could not be saved; automatic upload blocked");
+                            }
+                        }
+                    }
+                }
                 info!("Recording data saved successfully during cleanup");
             }
             Ok(Err(_)) => {

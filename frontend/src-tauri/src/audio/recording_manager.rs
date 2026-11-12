@@ -258,6 +258,9 @@ impl RecordingManager {
             ("No System Audio".to_string(), super::device_detection::InputDeviceKind::Unknown)
         };
 
+        self.recording_saver.start_accumulation(auto_save, recording_receiver);
+        let source_folder = if auto_save { self.get_meeting_folder() } else { None };
+
         // Start the audio processing pipeline with FFmpeg adaptive mixer
         // Pipeline will: 1) Mix mic+system audio with adaptive buffering, 2) Send mixed to recording_sender,
         // 3) Apply VAD and send speech segments to transcription
@@ -271,12 +274,13 @@ impl RecordingManager {
             mic_kind,
             sys_name,
             sys_kind,
+            source_folder,
         ) {
             self.state.stop_recording();
             return Err(RecordingStartError::TranscriptionRuntime(error));
         }
 
-        self.recording_saver.start_accumulation(auto_save, recording_receiver);
+
         self.recording_saver.set_device_info(
             microphone_device.as_ref().map(|d| d.name.clone()),
             system_device.as_ref().map(|d| d.name.clone())
@@ -404,10 +408,7 @@ impl RecordingManager {
             Ok(None) => {
                 debug!("Recording not saved (auto-save disabled or no audio data)");
             }
-            Err(e) => {
-                error!("Failed to save recording: {}", e);
-                // Don't fail the stop operation if saving fails
-            }
+            Err(e) => return Err(anyhow::anyhow!(e)),
         }
 
         debug!("Recording save operation completed");

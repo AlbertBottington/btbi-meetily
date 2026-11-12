@@ -23,3 +23,5 @@ pub use worker::{
     reset_speech_detected_flag,
     TranscriptUpdate
 };
+
+pub use worker::{BTBI_TRANSCRIPTION_FAILED, BTBI_SEGMENTS};
