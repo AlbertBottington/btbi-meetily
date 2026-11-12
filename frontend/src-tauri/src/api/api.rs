@@ -968,6 +968,8 @@ pub async fn api_save_transcript<R: Runtime>(
         auth_token.is_some()
     );
 
+    let btbi_folder = folder_path.clone();
+
     // Convert serde_json::Value to TranscriptSegment
     let transcripts_to_save: Vec<TranscriptSegment> = transcripts
         .into_iter()
@@ -995,7 +997,11 @@ pub async fn api_save_transcript<R: Runtime>(
                 "Successfully saved transcript and created meeting with id: {}",
                 meeting_id
             );
+            let upload_error = if let Some(folder) = btbi_folder {
+                crate::btbi::enqueue(std::path::Path::new(&folder), &meeting_id, serde_json::Value::Null).await.err().map(|e|e.to_string())
+            } else { None };
             Ok(serde_json::json!({
+                "upload_error":upload_error,
                 "status": "success",
                 "message": "Transcript saved successfully",
                 "meeting_id": meeting_id

@@ -15,6 +15,7 @@ export interface SaveMeetingRequest {
 }
 
 export interface SaveMeetingResponse {
+  upload_error?: string | null;
   meeting_id: string;
 }
 

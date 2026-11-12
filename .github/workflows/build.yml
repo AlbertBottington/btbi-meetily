@@ -39,6 +39,10 @@ on:
         required: false
         type: string
         default: ${{ github.ref }}
+      native-test-filter:
+        required: false
+        type: string
+        default: ""
       is-debug-build:
         required: false
         type: boolean
@@ -625,6 +629,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y fuse libfuse2
+
+      - name: Test requested native subsystem
+        if: inputs.native-test-filter != ''
+        shell: bash
+        env:
+          TEST_FILTER: ${{ inputs.native-test-filter }}
+        run: cargo test -p meetily --lib "$TEST_FILTER" ${{ steps.build-features.outputs.features }}
 
       - name: Build with Tauri
         id: tauri-build

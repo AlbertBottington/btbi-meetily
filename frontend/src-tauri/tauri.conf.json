@@ -1,8 +1,8 @@
 {
     "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-    "productName": "meetily",
+    "productName": "BTBI Meetily",
     "version": "0.4.1",
-    "identifier": "com.meetily.ai",
+    "identifier": "com.btbiconsulting.meetily",
     "build": {
         "frontendDist": "../out",
         "devUrl": "http://localhost:3118",
@@ -93,7 +93,7 @@
             "app",
             "dmg"
         ],
-        "createUpdaterArtifacts": true,
+        "createUpdaterArtifacts": false,
         "icon": [
             "icons/icon.png",
             "icons/icon_512x512.png",
@@ -113,7 +113,11 @@
         ],
         "linux": {
             "deb": {
-                "depends": ["libvulkan1", "libpulse0", "libasound2"]
+                "depends": [
+                    "libvulkan1",
+                    "libpulse0",
+                    "libasound2"
+                ]
             }
         },
         "macOS": {
@@ -121,16 +125,7 @@
             "signingIdentity": "-",
             "hardenedRuntime": true
         },
-        "windows": {
-            "signCommand": "powershell -ExecutionPolicy Bypass -File scripts/sign-windows.ps1 -FilePath %1"
-        }
+        "windows": {}
     },
-    "plugins": {
-        "updater": {
-            "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEVDQTYzMUQ3ODc5N0M4MkEKUldRcXlKZUgxekdtN09DRkVWSHNpZlJseEVOUmpNd1dDSTNaLzZ3MXJGTnY3WW1pdnlOYjBpbkIK",
-            "endpoints": [
-                "https://github.com/Zackriya-Solutions/meeting-minutes/releases/latest/download/latest.json"
-            ]
-        }
-    }
+    "plugins": {}
 }

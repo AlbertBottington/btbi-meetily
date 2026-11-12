@@ -305,6 +305,16 @@ impl AudioMixerRingBuffer {
     }
 
     #[cfg(not(target_os = "linux"))]
+    fn extract_tail(&mut self) -> Option<(Vec<f32>, Vec<f32>)> {
+        let count = self.mic_buffer.len().max(self.system_buffer.len());
+        if count == 0 { return None; }
+        let mut mic: Vec<f32> = self.mic_buffer.drain(..).collect();
+        let mut system: Vec<f32> = self.system_buffer.drain(..).collect();
+        mic.resize(count, 0.0); system.resize(count, 0.0);
+        Some((mic, system))
+    }
+
+    #[cfg(not(target_os = "linux"))]
     fn can_mix(&self) -> bool {
         self.mic_buffer.len() >= self.window_size_samples ||
         self.system_buffer.len() >= self.window_size_samples
@@ -984,6 +994,8 @@ pub struct AudioPipeline {
     mixer: ProfessionalAudioMixer,
     // Recording sender for pre-mixed audio
     recording_sender_for_mixed: Option<mpsc::UnboundedSender<AudioChunk>>,
+    btbi_pipeline_failed: bool,
+    source_tracks: Option<(btbi_core::capture::Tracks, std::path::PathBuf)>,
 }
 
 impl AudioPipeline {
@@ -1058,6 +1070,8 @@ impl AudioPipeline {
             // Initialize professional audio mixing
             ring_buffer,
             mixer,
+            source_tracks: None,
+            btbi_pipeline_failed: false,
             recording_sender_for_mixed: None,  // Will be set by manager
         })
     }
@@ -1092,6 +1106,15 @@ impl AudioPipeline {
                         continue;
                     }
 
+                    if let Some((tracks, _)) = self.source_tracks.as_mut() {
+                        if tracks.append(chunk.device_type == super::recording_state::DeviceType::Microphone,
+                            chunk.timestamp, chunk.sample_rate, &chunk.data).is_err() {
+                            // Keep the ordinary recording, but never mark source capture complete.
+                            self.source_tracks = None;
+                            error!("Source audio write failed; automatic upload is blocked");
+                        }
+                    }
+
                     if self.last_summary_time.elapsed() >= std::time::Duration::from_secs(60) {
                         self.emit_log_summary(false);
                     }
@@ -1115,6 +1138,13 @@ impl AudioPipeline {
 
         self.flush_remaining_audio()?;
         self.emit_log_summary(true);
+        if let Some((tracks, folder)) = self.source_tracks.take() {
+            tracks.finish(&folder)?;
+            if self.btbi_pipeline_failed {
+                std::fs::remove_file(folder.join("sources-complete.json"))?;
+                error!("Capture pipeline lost data; automatic upload requires review");
+            }
+        }
         info!("VAD-driven audio pipeline ended");
         Ok(())
     }
@@ -1158,6 +1188,7 @@ impl AudioPipeline {
                         };
                         if self.transcription_sender.send(transcription_chunk).is_err() {
                             self.log_stats.send_failures += 1;
+                            self.btbi_pipeline_failed = true;
                         } else {
                             self.chunk_id_counter += 1;
                         }
@@ -1166,7 +1197,7 @@ impl AudioPipeline {
                     }
                 }
             }
-            Err(error) => self.log_stats.record_vad_failure(VadOperation::Process, &error),
+            Err(error) => { self.btbi_pipeline_failed = true; self.log_stats.record_vad_failure(VadOperation::Process, &error); },
         }
 
         // STEP 4: Send mixed audio for recording (WAV file)
@@ -1178,13 +1209,17 @@ impl AudioPipeline {
                 chunk_id: self.chunk_id_counter,
                 device_type: DeviceType::Microphone,  // Mixed audio
             };
-            let _ = sender.send(recording_chunk);
+            if sender.send(recording_chunk).is_err() { self.btbi_pipeline_failed = true; }
         }
     }
 
     fn flush_remaining_audio(&mut self) -> Result<()> {
         #[cfg(target_os = "linux")]
         self.mix_ready(true, 0.0);
+        #[cfg(not(target_os = "linux"))]
+        if let Some((mic, system)) = self.ring_buffer.extract_tail() {
+            self.emit_mixed_window(&mic, &system, 0.0);
+        }
         match self.vad_processor.flush() {
             Ok(final_segments) => {
                 for segment in final_segments {
@@ -1200,6 +1235,7 @@ impl AudioPipeline {
                         };
                         if self.transcription_sender.send(transcription_chunk).is_err() {
                             self.log_stats.send_failures += 1;
+                            self.btbi_pipeline_failed = true;
                         } else {
                             self.chunk_id_counter += 1;
                         }
@@ -1208,7 +1244,7 @@ impl AudioPipeline {
                     }
                 }
             }
-            Err(error) => self.log_stats.record_vad_failure(VadOperation::Flush, &error),
+            Err(error) => { self.btbi_pipeline_failed = true; self.log_stats.record_vad_failure(VadOperation::Flush, &error); },
         }
         Ok(())
     }
@@ -1216,6 +1252,7 @@ impl AudioPipeline {
     fn emit_log_summary(&mut self, final_summary: bool) {
         let stats = self.log_stats.snapshot_and_reset();
         let (mic_dropped, system_dropped) = self.ring_buffer.take_dropped_samples();
+        if mic_dropped > 0 || system_dropped > 0 { self.btbi_pipeline_failed = true; }
         let mean_duration_ms = if stats.emitted == 0 {
             0.0
         } else {
@@ -1259,6 +1296,7 @@ impl AudioPipelineManager {
         mic_device_kind: super::device_detection::InputDeviceKind,
         system_device_name: String,
         system_device_kind: super::device_detection::InputDeviceKind,
+        source_folder: Option<std::path::PathBuf>,
     ) -> Result<()> {
         // Log device information for adaptive buffering
         info!("🎙️ Starting pipeline with device info:");
@@ -1281,6 +1319,9 @@ impl AudioPipelineManager {
             system_device_name,
             system_device_kind,
         )?;
+        if let Some(folder) = source_folder {
+            pipeline.source_tracks = Some((btbi_core::capture::Tracks::new(&folder)?, folder));
+        }
         state.set_audio_sender(audio_sender.clone());
 
         // CRITICAL FIX: Connect recording sender to receive pre-mixed audio
@@ -1415,5 +1456,19 @@ mod policy_tests {
         // uninterrupted speech. Batch import/retranscription use 2000ms.
         // See #679 and #756.
         assert_eq!(VAD_REDEMPTION_TIME_MS, 500);
+    }
+}
+
+#[cfg(all(test, not(target_os = "linux")))]
+mod btbi_pipeline_tests {
+    use super::*;
+    #[test]
+    fn final_partial_window_preserves_all_samples_once() {
+        let mut ring = AudioMixerRingBuffer::new(48000);
+        ring.add_samples(DeviceType::Microphone, vec![0.1, 0.2, 0.3]);
+        ring.add_samples(DeviceType::System, vec![0.4]);
+        assert!(ring.extract_window().is_none());
+        assert_eq!(ring.extract_tail(), Some((vec![0.1, 0.2, 0.3], vec![0.4, 0.0, 0.0])));
+        assert!(ring.extract_tail().is_none());
     }
 }

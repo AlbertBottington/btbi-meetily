@@ -36,6 +36,7 @@ pub(crate) use perf_trace;
 // Re-export async logging macros for external use (removed due to macro conflicts)
 
 // Declare audio module
+pub mod btbi;
 pub mod analytics;
 pub mod api;
 pub mod audio;
@@ -593,6 +594,7 @@ pub fn run() {
                 Err(_) => eprintln!("Meetily logging is unavailable or degraded."),
             }
 
+            if let Err(e) = btbi::initialize(_app.handle()) { log::error!("BTBI uploader unavailable: {}", e); }
             log::info!("Starting application...");
 
             #[cfg(target_os = "windows")]
@@ -729,6 +731,7 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            btbi::btbi_status, btbi::btbi_configure, btbi::btbi_begin_signin, btbi::btbi_retry,
             start_recording,
             stop_recording,
             is_recording,
