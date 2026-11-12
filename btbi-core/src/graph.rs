@@ -135,17 +135,28 @@ pub async fn profile(access: &str) -> Result<Profile> {
 pub struct Graph {
     client: Client,
     token: String,
+    base: String,
 }
 impl Graph {
     pub fn new(token: String) -> Result<Self> {
         Ok(Self {
             client: client()?,
             token,
+            base: "https://graph.microsoft.com/v1.0".into(),
         })
+    }
+    fn validate_transfer_url(&self, url: &str) -> Result<()> {
+        // Only the test binary permits its own loopback mock server.
+        #[cfg(test)]
+        if self.base.starts_with("http://127.0.0.1:") && url.starts_with(&format!("{}/", self.base))
+        {
+            return Ok(());
+        }
+        validate_upload_url(url)
     }
     async fn get(&self, path: &str) -> Result<reqwest::Response> {
         self.client
-            .get(format!("https://graph.microsoft.com/v1.0/{path}"))
+            .get(format!("{}/{path}", self.base))
             .bearer_auth(&self.token)
             .send()
             .await
@@ -153,7 +164,7 @@ impl Graph {
     }
     async fn post(&self, path: &str, body: Value) -> Result<reqwest::Response> {
         self.client
-            .post(format!("https://graph.microsoft.com/v1.0/{path}"))
+            .post(format!("{}/{path}", self.base))
             .bearer_auth(&self.token)
             .json(&body)
             .send()
@@ -210,7 +221,7 @@ impl Graph {
         let download = item["@microsoft.graph.downloadUrl"]
             .as_str()
             .context("Missing remote verification URL")?;
-        validate_upload_url(download)?;
+        self.validate_transfer_url(download)?;
         let mut r = self
             .client
             .get(download)
@@ -282,7 +293,7 @@ impl Graph {
                 bail!("Empty capture file requires review");
             }
             if let Some(url) = state.upload_url.clone() {
-                validate_upload_url(&url)?;
+                self.validate_transfer_url(&url)?;
                 let r = self
                     .client
                     .get(&url)
@@ -309,7 +320,7 @@ impl Graph {
                     .as_str()
                     .context("Missing upload URL")?
                     .to_string();
-                validate_upload_url(&url)?;
+                self.validate_transfer_url(&url)?;
                 state.upload_url = Some(url);
                 state.offset = 0;
             }
@@ -427,5 +438,205 @@ mod tests {
         );
         assert!(next_offset(&json!({"nextExpectedRanges":["1-"]}), 999999).is_err());
         assert!(next_offset(&json!({"nextExpectedRanges":["0-","100-"]}), 999999).is_err());
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+    #[derive(Default)]
+    struct Remote {
+        offsets: HashMap<String, u64>,
+        files: HashMap<String, Vec<u8>>,
+        partial: HashMap<String, Vec<u8>>,
+        throttled: bool,
+        auth_leaked: bool,
+        folders: usize,
+    }
+    async fn mock() -> (String, Arc<Mutex<Remote>>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let state = Arc::new(Mutex::new(Remote::default()));
+        let shared = state.clone();
+        let origin = base.clone();
+        let job = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut buf = [0u8; 65536];
+                let header_end = loop {
+                    let n = stream.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break None;
+                    }
+                    bytes.extend_from_slice(&buf[..n]);
+                    if let Some(p) = bytes.windows(4).position(|x| x == b"\r\n\r\n") {
+                        break Some(p + 4);
+                    }
+                };
+                let Some(end) = header_end else {
+                    continue;
+                };
+                let headers = String::from_utf8(bytes[..end].to_vec()).unwrap();
+                let length = headers
+                    .lines()
+                    .find_map(|l| {
+                        l.to_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                while bytes.len() < end + length {
+                    let n = stream.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&buf[..n]);
+                }
+                let mut parts = headers.lines().next().unwrap().split_whitespace();
+                let method = parts.next().unwrap();
+                let path = parts.next().unwrap();
+                let mut code = 200;
+                let mut extra = String::new();
+                let body;
+                {
+                    let mut remote = shared.lock().unwrap();
+                    if path.starts_with("/transfer/") || path.starts_with("/download/") {
+                        remote.auth_leaked |= headers.to_lowercase().contains("authorization:");
+                    }
+                    if path.ends_with("/children") {
+                        remote.folders += 1;
+                        code = 201;
+                        body = json!({"id":"remote","folder":{}}).to_string().into_bytes();
+                    } else if path.starts_with("/download/") {
+                        body = remote.files[path.trim_start_matches("/download/")].clone();
+                    } else if path.starts_with("/transfer/") {
+                        let name = path.trim_start_matches("/transfer/").to_string();
+                        if method == "GET" {
+                            body=json!({"nextExpectedRanges":[format!("{}-",remote.offsets.get(&name).copied().unwrap_or(0))]}).to_string().into_bytes();
+                        } else if name == "audio.dat"
+                            && remote.offsets.get(&name).copied().unwrap_or(0) > 0
+                            && !remote.throttled
+                        {
+                            remote.throttled = true;
+                            code = 503;
+                            extra = "Retry-After: 1\r\n".into();
+                            body = b"{}".to_vec();
+                        } else {
+                            let range = headers
+                                .lines()
+                                .find(|l| l.to_lowercase().starts_with("content-range:"))
+                                .unwrap();
+                            let total = range.rsplit('/').next().unwrap().parse::<u64>().unwrap();
+                            let offset = remote.offsets.get(&name).copied().unwrap_or(0);
+                            assert!(range.contains(&format!("bytes {}-", offset)));
+                            let data = remote.partial.entry(name.clone()).or_default();
+                            data.extend_from_slice(&bytes[end..end + length]);
+                            let next = data.len() as u64;
+                            if next == total {
+                                let data = remote.partial.remove(&name).unwrap();
+                                remote.files.insert(name.clone(), data);
+                                code = 201;
+                                body = json!({"size":total}).to_string().into_bytes();
+                            } else {
+                                code = 202;
+                                body = json!({"nextExpectedRanges":[format!("{next}-")]})
+                                    .to_string()
+                                    .into_bytes();
+                            }
+                            remote.offsets.insert(name, next);
+                        }
+                    } else if path.ends_with(":/createUploadSession") {
+                        let name = path.split(":/").nth(1).unwrap().trim_end_matches(':');
+                        body = json!({"uploadUrl":format!("{origin}/transfer/{name}")})
+                            .to_string()
+                            .into_bytes();
+                    } else {
+                        let name = path.split(":/").nth(1).unwrap();
+                        if let Some(data) = remote.files.get(name) {
+                            body=json!({"size":data.len(),"@microsoft.graph.downloadUrl":format!("{origin}/download/{name}")}).to_string().into_bytes();
+                        } else {
+                            code = 404;
+                            body = b"{}".to_vec();
+                        }
+                    }
+                }
+                let response=format!("HTTP/1.1 {code} Test\r\nContent-Length: {}\r\nContent-Type: application/json\r\n{extra}Connection: close\r\n\r\n",body.len());
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.write_all(&body).await.unwrap();
+            }
+        });
+        (base, state, job)
+    }
+    #[tokio::test]
+    async fn resumes_after_throttle_and_reconciles_lost_commit_receipt() {
+        let (base, remote, server) = mock().await;
+        let d = tempfile::tempdir().unwrap();
+        let data = vec![42u8; 10 * 1024 * 1024 + 320 * 1024];
+        std::fs::write(d.path().join("audio.dat"), &data).unwrap();
+        let manifest = Manifest {
+            version: 1,
+            capture_id: uuid::Uuid::new_v4(),
+            meeting_id: "synthetic".into(),
+            recorder_id: "person".into(),
+            recorder_name: "Synthetic".into(),
+            destination: Destination {
+                tenant_id: uuid::Uuid::new_v4().to_string(),
+                client_id: uuid::Uuid::new_v4().to_string(),
+                drive_id: "drive".into(),
+                folder_id: "folder".into(),
+            },
+            files: vec![crate::queue::PackageFile {
+                name: "audio.dat".into(),
+                bytes: data.len() as u64,
+                sha256: crate::queue::hash(&d.path().join("audio.dat")).unwrap(),
+            }],
+        };
+        crate::queue::atomic_json(&d.path().join("manifest.json"), &manifest).unwrap();
+        Queue::save_state(
+            d.path(),
+            &crate::queue::UploadState {
+                status: "Pending".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let graph = Graph {
+            client: client().unwrap(),
+            token: "synthetic-only".into(),
+            base: base.clone(),
+        };
+        let error = graph.upload(d.path(), "person").await.unwrap_err();
+        assert_eq!(error.downcast_ref::<RetryDelay>().unwrap().0, 1);
+        assert_eq!(Queue::state(d.path()).unwrap().offset, 10 * 1024 * 1024);
+        assert!(!remote.lock().unwrap().files.contains_key("manifest.json"));
+        // New Graph instance and on-disk state emulate process restart.
+        let restarted = Graph {
+            client: client().unwrap(),
+            token: "synthetic-only".into(),
+            base,
+        };
+        restarted.upload(d.path(), "person").await.unwrap();
+        assert_eq!(Queue::state(d.path()).unwrap().status, "Uploaded");
+        // Rewind only the local receipt: remote content must be hashed, not duplicated.
+        let mut lost = Queue::state(d.path()).unwrap();
+        lost.status = "Uploading".into();
+        lost.file_index = 0;
+        Queue::save_state(d.path(), &lost).unwrap();
+        restarted.upload(d.path(), "person").await.unwrap();
+        let r = remote.lock().unwrap();
+        assert_eq!(r.files["audio.dat"], data);
+        assert_eq!(r.files.len(), 2);
+        assert_eq!(r.folders, 1);
+        assert!(!r.auth_leaked);
+        server.abort();
     }
 }

@@ -22,3 +22,4 @@ jobs:
       sign-binaries: false
       asset-prefix: btbi-meetily-pilot
       upload-artifacts: true
+      native-test-filter: btbi_pipeline_tests

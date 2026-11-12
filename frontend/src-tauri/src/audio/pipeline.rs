@@ -305,6 +305,16 @@ impl AudioMixerRingBuffer {
     }
 
     #[cfg(not(target_os = "linux"))]
+    fn extract_tail(&mut self) -> Option<(Vec<f32>, Vec<f32>)> {
+        let count = self.mic_buffer.len().max(self.system_buffer.len());
+        if count == 0 { return None; }
+        let mut mic: Vec<f32> = self.mic_buffer.drain(..).collect();
+        let mut system: Vec<f32> = self.system_buffer.drain(..).collect();
+        mic.resize(count, 0.0); system.resize(count, 0.0);
+        Some((mic, system))
+    }
+
+    #[cfg(not(target_os = "linux"))]
     fn can_mix(&self) -> bool {
         self.mic_buffer.len() >= self.window_size_samples ||
         self.system_buffer.len() >= self.window_size_samples
@@ -1206,6 +1216,10 @@ impl AudioPipeline {
     fn flush_remaining_audio(&mut self) -> Result<()> {
         #[cfg(target_os = "linux")]
         self.mix_ready(true, 0.0);
+        #[cfg(not(target_os = "linux"))]
+        if let Some((mic, system)) = self.ring_buffer.extract_tail() {
+            self.emit_mixed_window(&mic, &system, 0.0);
+        }
         match self.vad_processor.flush() {
             Ok(final_segments) => {
                 for segment in final_segments {
@@ -1442,5 +1456,19 @@ mod policy_tests {
         // uninterrupted speech. Batch import/retranscription use 2000ms.
         // See #679 and #756.
         assert_eq!(VAD_REDEMPTION_TIME_MS, 500);
+    }
+}
+
+#[cfg(all(test, not(target_os = "linux")))]
+mod btbi_pipeline_tests {
+    use super::*;
+    #[test]
+    fn final_partial_window_preserves_all_samples_once() {
+        let mut ring = AudioMixerRingBuffer::new(48000);
+        ring.add_samples(DeviceType::Microphone, vec![0.1, 0.2, 0.3]);
+        ring.add_samples(DeviceType::System, vec![0.4]);
+        assert!(ring.extract_window().is_none());
+        assert_eq!(ring.extract_tail(), Some((vec![0.1, 0.2, 0.3], vec![0.4, 0.0, 0.0])));
+        assert!(ring.extract_tail().is_none());
     }
 }

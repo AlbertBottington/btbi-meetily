@@ -158,7 +158,7 @@ impl Queue {
             ensure!(src.is_file(), "Required capture file missing: {name}");
             let dst = staging.path().join(name);
             fs::copy(&src, &dst)?;
-            File::open(&dst)?.sync_all()?;
+            fs::OpenOptions::new().write(true).open(&dst)?.sync_all()?;
             files.push(PackageFile {
                 name: name.into(),
                 bytes: dst.metadata()?.len(),
