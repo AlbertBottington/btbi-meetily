@@ -115,3 +115,27 @@ test('does not let one safe cache hide an unsafe cache in the selected build', (
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /GGML_NATIVE must be explicitly OFF/);
 });
+
+
+test('accepts Cargo 1.100 nested hashes for both dependencies', (t) => {
+  const result = runGuard(t, {
+    'target/release/build/whisper-rs-sys/abc123': portableCache,
+    'target/release/build/llama-cpp-sys-2/def456': portableCache,
+  }, 'target/release', ['--require-llama']);
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test('checks every nested hash and rejects unsafe evidence', (t) => {
+  const result = runGuard(t, {
+    'target/release/build/whisper-rs-sys/abc123': portableCache,
+    'target/release/build/whisper-rs-sys/def456': portableCache.replace('GGML_NATIVE:BOOL=OFF', 'GGML_NATIVE:BOOL=ON'),
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /GGML_NATIVE must be explicitly OFF/);
+});
+
+test('does not accept similarly named packages as nested evidence', (t) => {
+  const result = runGuard(t, { 'target/release/build/whisper-rs-sys-unrelated/abc123': portableCache });
+  // No legacy direct cache and the exact package directory is absent.
+  assert.notEqual(result.status, 0);
+});

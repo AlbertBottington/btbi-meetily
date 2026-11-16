@@ -24,10 +24,11 @@ page memory or include it in crash dumps.
   320KiB-aligned requests into a final SharePoint upload session whose total
   length is now known. A final download/hash check verifies the recording.
 - No filesystem calls in these two modules. Processing memory is bounded by
-  one segment plus a transfer block, not meeting duration. The capture caller
-  still needs a bounded queue and explicit failure state.
+  one segment plus a transfer block, not meeting duration. The native capture
+  caller uses the bounded queue and failure state described below.
 - Existing remote content is accepted only if its bytes match; retries after
-  final commit do not create another recording. No cleanup method is enabled.
+  final commit do not create another recording. Conditional segment cleanup runs
+  only after final artifact verification.
 
 ## Native integration and processor
 
@@ -60,10 +61,13 @@ and offline_access. Other folders must be denied in live acceptance.
 
 ## Remaining acceptance / release gates
 
-- Publish the reviewed changes to the existing PR and run Windows CI. The prior
-  installer failed in ort-sys while copying DLLs into absent debug/examples;
-  the workflow now prepares the required output directories. Windows execution
-  is still required to prove that fix.
+- Pass Windows CI and obtain human review of the final PR head. Cargo 1.100
+  changed its build-output layout; the exact-version ort-sys CI patch resolves
+  the profile directory from the build ancestor rather than a fixed depth.
+  The pipeline tests both layouts before native tests and packaging. The CPU
+  portability guard also discovers nested CMake caches without weakening flag
+  checks. Both Windows core and native subsystem tests passed at `1cfdc42`;
+  installer packaging still required the portability-discovery fix.
 - Install and sign in on Matt's PC and the Mac worker. Register the processor
   through a reviewed service setup; no new service or schedule is active yet.
 - Record live microphone/system audio, confirm the final words, timeline and
