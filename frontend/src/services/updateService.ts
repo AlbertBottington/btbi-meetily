@@ -9,6 +9,8 @@ import { check, Update } from '@tauri-apps/plugin-updater';
 import { relaunch } from '@tauri-apps/plugin-process';
 import { getVersion } from '@tauri-apps/api/app';
 
+export const AUTOMATIC_UPDATES_ENABLED = false;
+
 export interface UpdateInfo {
   available: boolean;
   currentVersion: string;
@@ -39,6 +41,9 @@ export class UpdateService {
    * @returns Promise with update information
    */
   async checkForUpdates(force = false): Promise<UpdateInfo> {
+    if (!AUTOMATIC_UPDATES_ENABLED) {
+      throw new Error("BTBI pilot updates are installed manually.");
+    }
     // Prevent concurrent update checks
     if (this.updateCheckInProgress) {
       throw new Error('Update check already in progress');

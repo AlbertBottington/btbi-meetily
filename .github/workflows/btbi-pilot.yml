@@ -1,7 +1,7 @@
 name: BTBI Windows pilot
 on:
   push:
-    branches: [albert/sharepoint-upload]
+    branches: [albert/sharepoint-upload, albert/meetily-startup-updater]
   workflow_dispatch:
 permissions:
   contents: write
