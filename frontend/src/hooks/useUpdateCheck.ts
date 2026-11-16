@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { updateService, UpdateInfo } from '@/services/updateService';
+import { updateService, UpdateInfo, AUTOMATIC_UPDATES_ENABLED } from '@/services/updateService';
 import { showUpdateNotification } from '@/components/UpdateNotification';
 
 interface UseUpdateCheckOptions {
@@ -47,7 +47,7 @@ export function useUpdateCheck(options: UseUpdateCheckOptions = {}) {
   };
 
   useEffect(() => {
-    if (checkOnMount) {
+    if (checkOnMount && AUTOMATIC_UPDATES_ENABLED) {
       // Delay the check slightly to avoid blocking app startup
       const timer = setTimeout(() => {
         checkForUpdates(false);

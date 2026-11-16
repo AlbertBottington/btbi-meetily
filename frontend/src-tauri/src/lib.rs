@@ -571,7 +571,7 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_log::Builder::new().skip_logger().build())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
+        // BTBI pilot uses reviewed installers; no updater config or plugin.
         .plugin(tauri_plugin_process::init())
         .manage(whisper_engine::parallel_commands::ParallelProcessorState::new())
         .manage(Arc::new(RwLock::new(
@@ -731,7 +731,7 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            btbi::btbi_status, btbi::btbi_configure, btbi::btbi_begin_signin, btbi::btbi_retry,
+            btbi::btbi_status, btbi::btbi_configure, btbi::btbi_begin_signin, btbi::btbi_signout, btbi::btbi_retry,
             start_recording,
             stop_recording,
             is_recording,

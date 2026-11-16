@@ -1,7 +1,7 @@
 name: BTBI Windows pilot
 on:
   push:
-    branches: [albert/sharepoint-upload]
+    branches: [albert/sharepoint-upload, albert/meetily-startup-updater, albert/meetily-token-storage]
   workflow_dispatch:
 permissions:
   contents: write
@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --manifest-path btbi-core/Cargo.toml --locked
+      - run: cargo test --manifest-path btbi-core/Cargo.toml --features token-store --locked
   installer:
     needs: core
     uses: ./.github/workflows/build.yml
