@@ -15,8 +15,17 @@ try {
   if (requireLlama) dependencies.push(['llama-cpp-sys-2-', 'llama-helper']);
   const caches = dependencies.flatMap(([prefix, label]) => {
     const matches = entries
-      .filter((entry) => entry.isDirectory() && entry.name.startsWith(prefix))
-      .map((entry) => join(buildDirectory, entry.name, 'out/build/CMakeCache.txt'))
+      .filter((entry) => entry.isDirectory()
+        && (entry.name.startsWith(prefix) || entry.name === prefix.slice(0, -1)))
+      .flatMap((entry) => {
+        const dependency = join(buildDirectory, entry.name);
+        // Cargo 1.100 nests the hash below the package name. Keep the old
+        // layout too, and inspect every matching cache rather than first match.
+        return [join(dependency, 'out/build/CMakeCache.txt'),
+          ...(entry.name === prefix.slice(0, -1) ? readdirSync(dependency, { withFileTypes: true }) : [])
+            .filter((child) => child.isDirectory() && /^[0-9a-f]+$/.test(child.name))
+            .map((child) => join(dependency, child.name, 'out/build/CMakeCache.txt'))];
+      })
       .filter(existsSync);
     if (matches.length === 0) {
       throw new Error(`No ${label} CMake cache found in ${buildDirectory}`);

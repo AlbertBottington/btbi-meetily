@@ -259,6 +259,7 @@ export function useRecordingStop(
             folderPath
           );
 
+          if (responseData.upload_error) { toast.error("Meeting saved locally; SharePoint upload needs attention", {description: responseData.upload_error}); }
           const meetingId = responseData.meeting_id;
           if (!meetingId) {
             console.error('No meeting_id in response:', responseData);

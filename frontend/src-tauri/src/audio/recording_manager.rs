@@ -233,12 +233,16 @@ impl RecordingManager {
     ) -> std::result::Result<mpsc::UnboundedReceiver<AudioChunk>, RecordingStartError> {
         info!("Starting recording manager (auto_save: {})", auto_save);
 
+        if !auto_save { return Err(RecordingStartError::TranscriptionRuntime(anyhow::anyhow!("Enable Save recordings for SharePoint capture; BTBI Meetily does not stage audio locally"))); }
+        crate::btbi::cloud_prepare(self.get_meeting_name().unwrap_or_else(|| "Meeting".into())).await
+            .map_err(RecordingStartError::TranscriptionRuntime)?;
+
         // Set up transcription channel
         let (transcription_sender, transcription_receiver) = mpsc::unbounded_channel::<AudioChunk>();
         let (recording_sender, recording_receiver) = mpsc::unbounded_channel::<AudioChunk>();
 
         // Start recording state first
-        self.state.start_recording()?;
+        if let Err(e) = self.state.start_recording() { crate::btbi::cloud_abort(); return Err(e.into()); }
 
         // Get device information for adaptive mixing
         // The pipeline uses device kind (Bluetooth vs Wired) to apply adaptive buffering:
@@ -258,6 +262,9 @@ impl RecordingManager {
             ("No System Audio".to_string(), super::device_detection::InputDeviceKind::Unknown)
         };
 
+        self.recording_saver.start_accumulation(auto_save, recording_receiver);
+        let source_folder = if auto_save { self.get_meeting_folder() } else { None };
+
         // Start the audio processing pipeline with FFmpeg adaptive mixer
         // Pipeline will: 1) Mix mic+system audio with adaptive buffering, 2) Send mixed to recording_sender,
         // 3) Apply VAD and send speech segments to transcription
@@ -271,12 +278,14 @@ impl RecordingManager {
             mic_kind,
             sys_name,
             sys_kind,
+            source_folder,
         ) {
             self.state.stop_recording();
+            crate::btbi::cloud_abort();
             return Err(RecordingStartError::TranscriptionRuntime(error));
         }
 
-        self.recording_saver.start_accumulation(auto_save, recording_receiver);
+
         self.recording_saver.set_device_info(
             microphone_device.as_ref().map(|d| d.name.clone()),
             system_device.as_ref().map(|d| d.name.clone())
@@ -404,10 +413,7 @@ impl RecordingManager {
             Ok(None) => {
                 debug!("Recording not saved (auto-save disabled or no audio data)");
             }
-            Err(e) => {
-                error!("Failed to save recording: {}", e);
-                // Don't fail the stop operation if saving fails
-            }
+            Err(e) => return Err(anyhow::anyhow!(e)),
         }
 
         debug!("Recording save operation completed");
@@ -566,6 +572,7 @@ impl RecordingManager {
 
     /// Cleanup all resources without saving
     pub async fn cleanup_without_save(&mut self) {
+        crate::btbi::cloud_abort();
         if self.is_recording() {
             debug!("Stopping recording without saving during cleanup");
 

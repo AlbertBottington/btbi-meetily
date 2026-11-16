@@ -1,3 +1,12 @@
+pub static BTBI_TRANSCRIPT: std::sync::Mutex<btbi_core::transcript::TranscriptCollector> =
+    std::sync::Mutex::new(btbi_core::transcript::TranscriptCollector::new());
+fn mark_capture_failed(generation: u64) {
+    if let Ok(mut capture) = BTBI_TRANSCRIPT.lock() { capture.fail(generation); }
+}
+struct WorkerTasks(Vec<tokio::task::JoinHandle<()>>);
+impl Drop for WorkerTasks {
+    fn drop(&mut self) { for task in &self.0 { task.abort(); } }
+}
 // audio/transcription/worker.rs
 //
 // Parallel transcription worker pool and chunk processing logic.
@@ -35,6 +44,7 @@ fn should_log_transcript_snippet(accepted_count: u64) -> bool {
 
 #[derive(Default)]
 struct WorkerLogStats {
+    capture_generation: u64,
     queued: u64,
     completed: u64,
     emitted: u64,
@@ -62,6 +72,7 @@ enum WorkerFailureCategory {
 
 impl WorkerLogStats {
     fn record_failure(&mut self, category: WorkerFailureCategory) {
+        mark_capture_failed(self.capture_generation);
         self.failed += 1;
         match category {
             WorkerFailureCategory::ModelNotLoaded => self.model_not_loaded_failures += 1,
@@ -75,7 +86,10 @@ impl WorkerLogStats {
     }
 
     fn snapshot_and_reset(&mut self) -> Self {
-        std::mem::take(self)
+        let generation = self.capture_generation;
+        let old = std::mem::take(self);
+        self.capture_generation = generation;
+        old
     }
 }
 
@@ -182,12 +196,14 @@ pub fn start_transcription_task<R: Runtime>(
     app: AppHandle<R>,
     transcription_receiver: tokio::sync::mpsc::UnboundedReceiver<AudioChunk>,
 ) -> tokio::task::JoinHandle<()> {
+    let generation = BTBI_TRANSCRIPT.lock().map(|c|c.generation()).unwrap_or(0);
     tokio::spawn(async move {
         info!("Starting transcription worker task");
 
         let transcription_engine = match super::engine::get_or_init_transcription_engine(&app).await {
             Ok(engine) => engine,
             Err(e) => {
+                mark_capture_failed(generation);
                 error!("Failed to initialize transcription engine");
                 let _ = app.emit("transcription-error", serde_json::json!({
                     "error": e,
@@ -204,7 +220,7 @@ pub fn start_transcription_task<R: Runtime>(
         let work_receiver = Arc::new(tokio::sync::Mutex::new(work_receiver));
         let chunks_queued = Arc::new(AtomicU64::new(0));
         let chunks_completed = Arc::new(AtomicU64::new(0));
-        let mut worker_handles = Vec::new();
+        let mut worker_handles = WorkerTasks(Vec::new());
 
         for worker_id in 0..NUM_WORKERS {
             let engine_clone = match &transcription_engine {
@@ -217,8 +233,8 @@ pub fn start_transcription_task<R: Runtime>(
             let chunks_completed_clone = chunks_completed.clone();
             let chunks_queued_clone = chunks_queued.clone();
 
-            worker_handles.push(tokio::spawn(async move {
-                let mut stats = WorkerLogStats::default();
+            worker_handles.0.push(tokio::spawn(async move {
+                let mut stats = WorkerLogStats { capture_generation: generation, ..Default::default() };
                 let mut last_summary = Instant::now();
 
                 while let Some(chunk) = {
@@ -282,6 +298,9 @@ pub fn start_transcription_task<R: Runtime>(
                                         duration: chunk_duration,
                                     };
 
+                                    let accepted = BTBI_TRANSCRIPT.lock().map(|mut c| c.push(generation,
+                                        serde_json::to_value(&update).expect("serializable transcript"))).unwrap_or(false);
+                                    if !accepted { break; }
                                     if app_clone.emit("transcript-update", &update).is_ok() {
                                         stats.emitted += 1;
                                         #[cfg(debug_assertions)]
@@ -361,8 +380,9 @@ pub fn start_transcription_task<R: Runtime>(
             "message": format!("{} chunks queued for processing - waiting for completion", total_chunks_queued)
         }));
 
-        for handle in worker_handles {
+        for handle in worker_handles.0.iter_mut() {
             if handle.await.is_err() {
+                mark_capture_failed(generation);
                 error!("Transcription worker panicked");
             }
         }
@@ -378,6 +398,7 @@ pub fn start_transcription_task<R: Runtime>(
         let final_queued = chunks_queued.load(Ordering::SeqCst);
         let final_completed = chunks_completed.load(Ordering::SeqCst);
         if final_queued != final_completed {
+            mark_capture_failed(generation);
             error!(
                 "Transcription chunk loss detected queued={} completed={}",
                 final_queued, final_completed

@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["btbi-core"]
 members = [
     "frontend/src-tauri",
     "llama-helper"

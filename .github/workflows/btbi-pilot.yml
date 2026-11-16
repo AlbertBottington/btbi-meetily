@@ -1,0 +1,25 @@
+name: BTBI Windows pilot
+on:
+  push:
+    branches: [albert/sharepoint-upload]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  core:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --manifest-path btbi-core/Cargo.toml --locked
+  installer:
+    needs: core
+    uses: ./.github/workflows/build.yml
+    with:
+      platform: windows-latest
+      target: x86_64-pc-windows-msvc
+      build-args: --bundles nsis
+      sign-binaries: false
+      asset-prefix: btbi-meetily-pilot
+      upload-artifacts: true
+      native-test-filter: btbi_pipeline_tests
