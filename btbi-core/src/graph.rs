@@ -35,7 +35,7 @@ pub struct Profile {
     #[serde(rename = "displayName")]
     pub name: String,
 }
-const SCOPE: &str = "offline_access User.Read Files.ReadWrite";
+const SCOPE: &str = "offline_access User.Read Files.SelectedOperations.Selected";
 fn authority(d: &Destination, suffix: &str) -> String {
     format!(
         "https://login.microsoftonline.com/{}/oauth2/v2.0/{}",
@@ -50,7 +50,7 @@ impl std::fmt::Display for RetryDelay {
     }
 }
 impl std::error::Error for RetryDelay {}
-async fn checked_json(r: reqwest::Response) -> Result<Value> {
+pub(crate) async fn checked_json(r: reqwest::Response) -> Result<Value> {
     let status = r.status();
     if status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::SERVICE_UNAVAILABLE {
         let seconds = r
@@ -133,9 +133,9 @@ pub async fn profile(access: &str) -> Result<Profile> {
 }
 
 pub struct Graph {
-    client: Client,
-    token: String,
-    base: String,
+    pub(crate) client: Client,
+    pub(crate) token: String,
+    pub(crate) base: String,
 }
 impl Graph {
     pub fn new(token: String) -> Result<Self> {
@@ -145,7 +145,7 @@ impl Graph {
             base: "https://graph.microsoft.com/v1.0".into(),
         })
     }
-    fn validate_transfer_url(&self, url: &str) -> Result<()> {
+    pub(crate) fn validate_transfer_url(&self, url: &str) -> Result<()> {
         // Only the test binary permits its own loopback mock server.
         #[cfg(test)]
         if self.base.starts_with("http://127.0.0.1:") && url.starts_with(&format!("{}/", self.base))
@@ -154,7 +154,7 @@ impl Graph {
         }
         validate_upload_url(url)
     }
-    async fn get(&self, path: &str) -> Result<reqwest::Response> {
+    pub(crate) async fn get(&self, path: &str) -> Result<reqwest::Response> {
         self.client
             .get(format!("{}/{path}", self.base))
             .bearer_auth(&self.token)
@@ -162,7 +162,7 @@ impl Graph {
             .await
             .map_err(|_| anyhow::anyhow!("SharePoint connection failed"))
     }
-    async fn post(&self, path: &str, body: Value) -> Result<reqwest::Response> {
+    pub(crate) async fn post(&self, path: &str, body: Value) -> Result<reqwest::Response> {
         self.client
             .post(format!("{}/{path}", self.base))
             .bearer_auth(&self.token)
@@ -207,7 +207,7 @@ impl Graph {
             .context("Missing folder identity")?
             .into())
     }
-    async fn existing_matches(&self, path: &str, bytes: u64, sha: &str) -> Result<bool> {
+    pub(crate) async fn existing_matches(&self, path: &str, bytes: u64, sha: &str) -> Result<bool> {
         let r = self.get(path).await?;
         if r.status() == StatusCode::NOT_FOUND {
             return Ok(false);
@@ -464,6 +464,8 @@ mod transport_tests {
         expire_next: bool,
         auth_leaked: bool,
         folders: usize,
+        deletes: usize,
+        deny_delete: bool,
     }
     async fn mock() -> (String, Arc<Mutex<Remote>>, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -516,7 +518,18 @@ mod transport_tests {
                     if path.starts_with("/transfer/") || path.starts_with("/download/") {
                         remote.auth_leaked |= headers.to_lowercase().contains("authorization:");
                     }
-                    if path.ends_with("/children") {
+                    if method == "DELETE" {
+                        let name = path.split(":/").nth(1).unwrap();
+                        assert!(headers.to_lowercase().contains("if-match:"));
+                        if remote.deny_delete {
+                            code = 412;
+                        } else {
+                            remote.files.remove(name);
+                            remote.deletes += 1;
+                            code = 204;
+                        }
+                        body = Vec::new();
+                    } else if path.ends_with("/children") {
                         remote.folders += 1;
                         code = 201;
                         body = json!({"id":"remote","folder":{}}).to_string().into_bytes();
@@ -572,7 +585,7 @@ mod transport_tests {
                     } else {
                         let name = path.split(":/").nth(1).unwrap();
                         if let Some(data) = remote.files.get(name) {
-                            body=json!({"size":data.len(),"@microsoft.graph.downloadUrl":format!("{origin}/download/{name}")}).to_string().into_bytes();
+                            body=json!({"size":data.len(),"eTag":"v1","@microsoft.graph.downloadUrl":format!("{origin}/download/{name}")}).to_string().into_bytes();
                         } else {
                             code = 404;
                             body = b"{}".to_vec();
@@ -668,5 +681,129 @@ mod transport_tests {
     #[tokio::test]
     async fn recreates_expired_session_without_duplicate_capture() {
         exercise_restart(true).await;
+    }
+    #[tokio::test]
+    async fn cloud_segments_assemble_without_disk_and_retry_without_duplicate() {
+        use crate::cloud_audio::{digest, header, Segmenter, RATE, SEGMENT_SAMPLES};
+        let (base, remote, server) = mock().await;
+        let graph = Graph {
+            client: client().unwrap(),
+            token: "sentinel-token".into(),
+            base,
+        };
+        let d = Destination {
+            tenant_id: uuid::Uuid::new_v4().to_string(),
+            client_id: uuid::Uuid::new_v4().to_string(),
+            drive_id: "drive".into(),
+            folder_id: "folder".into(),
+        };
+        let capture = uuid::Uuid::new_v4();
+        let input = vec![0.25; SEGMENT_SAMPLES * 2 + 13];
+        let mut segmenter = Segmenter::default();
+        let mut parts = Vec::new();
+        segmenter
+            .push(&input, RATE, |p| {
+                parts.push(p);
+                Ok(())
+            })
+            .unwrap();
+        parts.push(segmenter.finish().unwrap().unwrap());
+        for p in &parts {
+            graph.upload_cloud_segment(&d, capture, p).await.unwrap();
+        }
+        let infos: Vec<_> = parts.iter().map(|p| p.info.clone()).collect();
+        let hash = graph
+            .assemble_cloud_audio(&d, capture, &infos)
+            .await
+            .unwrap();
+        let mut expected = header(input.len() as u64).unwrap();
+        for x in input {
+            expected.extend(((x * 32767.0).round() as i16).to_le_bytes());
+        }
+        assert_eq!(hash, digest(&expected));
+        assert_eq!(
+            graph
+                .assemble_cloud_audio(&d, capture, &infos)
+                .await
+                .unwrap(),
+            hash
+        );
+        {
+            let state = remote.lock().unwrap();
+            assert_eq!(state.files[&format!("{capture}/recording.wav")], expected);
+            assert_eq!(state.files.len(), 4);
+            assert!(!state.auth_leaked);
+        }
+        // Corruption prevents assembly acceptance even when a prior final exists.
+        remote
+            .lock()
+            .unwrap()
+            .files
+            .get_mut(&format!("{capture}/segment-00000000.wav"))
+            .unwrap()[44] ^= 1;
+        assert!(graph
+            .assemble_cloud_audio(&d, capture, &infos)
+            .await
+            .is_err());
+        assert_eq!(remote.lock().unwrap().files.len(), 4);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn cloud_cleanup_only_after_verified_finals_and_retries_safely() {
+        use crate::cloud_audio::{Segmenter, RATE};
+        let (base, remote, server) = mock().await;
+        let graph = Graph {
+            client: client().unwrap(),
+            token: "sentinel-token".into(),
+            base,
+        };
+        let d = Destination {
+            tenant_id: uuid::Uuid::new_v4().to_string(),
+            client_id: uuid::Uuid::new_v4().to_string(),
+            drive_id: "drive".into(),
+            folder_id: "folder".into(),
+        };
+        let capture = uuid::Uuid::new_v4();
+        let mut seg = Segmenter::default();
+        seg.push(&[0.1; 1000], RATE, |_| Ok(())).unwrap();
+        let part = seg.finish().unwrap().unwrap();
+        graph
+            .upload_cloud_track_segment(&d, capture, 0, &part)
+            .await
+            .unwrap();
+        let manifest = json!({"version":1,"capture_id":capture,"state":"ready_for_assembly","tracks":[[part.info],[],[]],"transcript":{"segments":[{"text":"final words"}]}});
+        graph
+            .publish_cloud_capture(&d, capture, &manifest)
+            .await
+            .unwrap();
+        remote.lock().unwrap().deny_delete = true;
+        assert!(graph.process_cloud_capture(&d, capture).await.is_err());
+        {
+            let state = remote.lock().unwrap();
+            assert_eq!(state.deletes, 0);
+            assert!(state
+                .files
+                .contains_key(&format!("{capture}/recording.wav")));
+            assert!(state
+                .files
+                .contains_key(&format!("{capture}/transcripts.json")));
+            assert!(state
+                .files
+                .contains_key(&format!("{capture}/segment-00000000.wav")));
+        }
+        // Corrupted final must block even a cleanup retry with a completion receipt.
+        let name = format!("{capture}/recording.wav");
+        remote.lock().unwrap().files.get_mut(&name).unwrap()[44] ^= 1;
+        assert!(graph.process_cloud_capture(&d, capture).await.is_err());
+        assert_eq!(remote.lock().unwrap().deletes, 0);
+        remote.lock().unwrap().files.get_mut(&name).unwrap()[44] ^= 1;
+        remote.lock().unwrap().deny_delete = false;
+        graph.process_cloud_capture(&d, capture).await.unwrap();
+        graph.process_cloud_capture(&d, capture).await.unwrap();
+        let state = remote.lock().unwrap();
+        assert_eq!(state.deletes, 1);
+        assert!(!state.auth_leaked);
+        drop(state);
+        server.abort();
     }
 }

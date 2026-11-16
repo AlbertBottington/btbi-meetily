@@ -1235,6 +1235,12 @@ async fn stop_recording_for_session<R: Runtime>(
             manager.save_recording_only(&app)
         ).await {
             Ok(Ok(_)) => {
+                if crate::btbi::cloud_active() {
+                    let transcript = transcription::BTBI_TRANSCRIPT.lock().map(|c| serde_json::json!({"segments":c.segments})).unwrap_or(serde_json::Value::Null);
+                    if let Err(e) = crate::btbi::cloud_finish(transcript, btbi_transcription_complete).await {
+                        let _ = app.emit("recording-error", e.to_string());
+                    }
+                }
                 if btbi_transcription_complete {
                     if let Some(ref folder) = meeting_folder {
                         if folder.join("sources-complete.json").is_file() {
@@ -1257,10 +1263,12 @@ async fn stop_recording_for_session<R: Runtime>(
                 info!("Recording data saved successfully during cleanup");
             }
             Ok(Err(_)) => {
+                crate::btbi::cloud_abort();
                 warn!("Recording cleanup failed; transcripts preserved");
                 // Don't fail shutdown - transcripts are already preserved
             }
             Err(_) => {
+                crate::btbi::cloud_abort();
                 warn!("⏱️ File I/O timeout (5 minutes) reached during save, continuing shutdown");
                 // Don't fail shutdown - transcripts are already preserved
             }

@@ -2,11 +2,15 @@
 
 Status: implementation under review, not a validated production release.
 
+The current cloud-only design supersedes the local snapshot pilot described
+below. See [cloud-only capture](cloud-only-capture.md) for its behavior and
+remaining acceptance checks. No installed build is implied.
+
 ## Setup
 
 Register a **single-tenant public-client** Microsoft Entra application for BTBI
 Meetily. Enable public client/device-code flow. Delegated permissions:
-`User.Read`, `Files.ReadWrite`, `offline_access`. No client secret belongs in this
+`User.Read`, `Files.SelectedOperations.Selected`, `offline_access`. No client secret belongs in this
 app. A tenant administrator may need to consent. Confirm that both Matt and
 Patrick can write to the intended SharePoint folder with these permissions;
 do not silently expand scopes if the tenant requires more.

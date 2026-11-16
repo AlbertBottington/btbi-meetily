@@ -233,12 +233,16 @@ impl RecordingManager {
     ) -> std::result::Result<mpsc::UnboundedReceiver<AudioChunk>, RecordingStartError> {
         info!("Starting recording manager (auto_save: {})", auto_save);
 
+        if !auto_save { return Err(RecordingStartError::TranscriptionRuntime(anyhow::anyhow!("Enable Save recordings for SharePoint capture; BTBI Meetily does not stage audio locally"))); }
+        crate::btbi::cloud_prepare(self.get_meeting_name().unwrap_or_else(|| "Meeting".into())).await
+            .map_err(RecordingStartError::TranscriptionRuntime)?;
+
         // Set up transcription channel
         let (transcription_sender, transcription_receiver) = mpsc::unbounded_channel::<AudioChunk>();
         let (recording_sender, recording_receiver) = mpsc::unbounded_channel::<AudioChunk>();
 
         // Start recording state first
-        self.state.start_recording()?;
+        if let Err(e) = self.state.start_recording() { crate::btbi::cloud_abort(); return Err(e.into()); }
 
         // Get device information for adaptive mixing
         // The pipeline uses device kind (Bluetooth vs Wired) to apply adaptive buffering:
@@ -277,6 +281,7 @@ impl RecordingManager {
             source_folder,
         ) {
             self.state.stop_recording();
+            crate::btbi::cloud_abort();
             return Err(RecordingStartError::TranscriptionRuntime(error));
         }
 
@@ -567,6 +572,7 @@ impl RecordingManager {
 
     /// Cleanup all resources without saving
     pub async fn cleanup_without_save(&mut self) {
+        crate::btbi::cloud_abort();
         if self.is_recording() {
             debug!("Stopping recording without saving during cleanup");
 

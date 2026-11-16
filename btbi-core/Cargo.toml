@@ -13,3 +13,12 @@ uuid = { version = "1", features = ["v4", "serde"] }
 reqwest = { version = "0.11", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
 url = "2"
+keyring = { version = "3", features = ["apple-native", "windows-native"], optional = true }
+
+[features]
+worker = ["dep:keyring"]
+
+[[bin]]
+name = "btbi-cloud-worker"
+path = "src/bin/btbi-cloud-worker.rs"
+required-features = ["worker"]

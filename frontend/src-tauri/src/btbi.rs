@@ -102,6 +102,9 @@ pub fn initialize<R: Runtime>(app: &AppHandle<R>) -> Result<()> {
     Ok(())
 }
 pub fn stamp_recorder(folder: Option<PathBuf>) -> Result<()> {
+    if cloud_active() {
+        return Ok(());
+    }
     let Ok(s) = settings() else {
         return Ok(());
     };
@@ -231,7 +234,7 @@ pub async fn btbi_status() -> Result<Value, String> {
 #[tauri::command]
 pub async fn btbi_configure(destination: Destination, enabled: bool) -> Result<(), String> {
     let _guard = OPERATION.lock().await;
-    if crate::audio::recording_commands::is_recording().await {
+    if crate::audio::recording_commands::is_recording().await || cloud_active() {
         return Err("Stop recording before changing upload settings".into());
     }
     destination.validate().map_err(message)?;
@@ -251,7 +254,7 @@ pub async fn btbi_configure(destination: Destination, enabled: bool) -> Result<(
 }
 #[tauri::command]
 pub async fn btbi_begin_signin() -> Result<Value, String> {
-    if crate::audio::recording_commands::is_recording().await {
+    if crate::audio::recording_commands::is_recording().await || cloud_active() {
         return Err("Stop recording before changing the Microsoft account".into());
     }
     use std::sync::atomic::Ordering;
@@ -327,4 +330,189 @@ pub async fn btbi_retry() -> Result<(), String> {
         queue::atomic_json(&folder.join("retry.json"), &json!({"after":0})).map_err(message)?;
     }
     Ok(())
+}
+
+// Cloud-only recording: audio never enters the legacy disk queue.
+// Credentials/settings remain in their existing protected locations.
+struct CloudCapture {
+    sender: tokio::sync::mpsc::Sender<(usize, btbi_core::cloud_audio::Segment)>,
+    segmenters: [btbi_core::cloud_audio::Segmenter; 3],
+    failed: bool,
+    task: tokio::task::JoinHandle<Result<Vec<Vec<btbi_core::cloud_audio::SegmentInfo>>>>,
+    capture: uuid::Uuid,
+    settings: Settings,
+    title: String,
+    source_index: Vec<(usize, f64, u64, usize)>,
+    samples: [u64; 3],
+}
+static CLOUD: std::sync::Mutex<Option<CloudCapture>> = std::sync::Mutex::new(None);
+
+pub fn cloud_active() -> bool {
+    CLOUD.lock().map(|s| s.is_some()).unwrap_or(true)
+}
+
+pub async fn cloud_prepare(title: String) -> Result<bool> {
+    let _guard = OPERATION.lock().await;
+    ensure!(
+        !SIGNING_IN.load(std::sync::atomic::Ordering::SeqCst),
+        "Wait for Microsoft sign-in to finish"
+    );
+    let s = settings()
+        .context("Configure SharePoint and sign in before recording with BTBI Meetily")?;
+    ensure!(
+        s.enabled && s.profile.is_some(),
+        "Enable SharePoint uploads before recording; local staging is disabled"
+    );
+    ensure!(!cloud_active(), "Previous cloud capture is still active");
+    let capture = uuid::Uuid::new_v4();
+    let graph = graph::Graph::new(access(&s).await?)?;
+    graph.begin_cloud_capture(&s.destination, capture).await?;
+    let (sender, mut receiver) =
+        tokio::sync::mpsc::channel::<(usize, btbi_core::cloud_audio::Segment)>(12);
+    let worker_settings = s.clone();
+    let task = tokio::spawn(async move {
+        let mut parts: Vec<Vec<btbi_core::cloud_audio::SegmentInfo>> =
+            vec![Vec::new(), Vec::new(), Vec::new()];
+        while let Some((track, segment)) = receiver.recv().await {
+            // Refresh credentials on every segment; no stale hour-long token.
+            let mut uploaded = false;
+            for attempt in 0..3 {
+                let graph = graph::Graph::new(access(&worker_settings).await?)?;
+                match graph
+                    .upload_cloud_track_segment(
+                        &worker_settings.destination,
+                        capture,
+                        track,
+                        &segment,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        uploaded = true;
+                        break;
+                    }
+                    Err(e) if attempt < 2 => {
+                        let delay = e
+                            .downcast_ref::<graph::RetryDelay>()
+                            .map(|d| d.0)
+                            .unwrap_or(5 * (attempt + 1));
+                        tokio::time::sleep(Duration::from_secs(delay.min(60))).await;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            ensure!(uploaded, "Segment upload incomplete");
+            parts[track].push(segment.info);
+        }
+        Ok(parts)
+    });
+    let mut state = CLOUD
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Cloud recorder unavailable"))?;
+    if state.is_some() {
+        task.abort();
+        anyhow::bail!("Cloud recording already active");
+    }
+    *state = Some(CloudCapture {
+        sender,
+        segmenters: std::array::from_fn(|_| Default::default()),
+        failed: false,
+        task,
+        capture,
+        settings: s,
+        title,
+        source_index: Vec::new(),
+        samples: [0; 3],
+    });
+    notice("Recording directly to SharePoint; do not close while uploads are pending.");
+    Ok(true)
+}
+
+pub fn cloud_audio(track: usize, samples: &[f32], rate: u32) -> Result<()> {
+    cloud_audio_at(track, samples, rate, None)
+}
+pub fn cloud_audio_at(
+    track: usize,
+    samples: &[f32],
+    rate: u32,
+    timestamp: Option<f64>,
+) -> Result<()> {
+    let mut state = CLOUD
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Cloud recorder unavailable"))?;
+    let Some(c) = state.as_mut() else {
+        return Ok(());
+    };
+    ensure!(
+        track < 3 && !c.failed,
+        "Cloud recording failed; capture is incomplete"
+    );
+    if let Some(timestamp) = timestamp {
+        if !timestamp.is_finite() || timestamp < 0.0 || c.source_index.len() >= 150_000 {
+            c.failed = true;
+            anyhow::bail!("Source timing buffer unavailable; capture incomplete");
+        }
+        c.source_index
+            .push((track, timestamp, c.samples[track], samples.len()));
+    }
+    c.samples[track] += samples.len() as u64;
+    let sender = c.sender.clone();
+    let result = c.segmenters[track].push(samples, rate, |segment| {
+        sender.try_send((track, segment)).map_err(|_| {
+            anyhow::anyhow!("Cloud upload backlog full or disconnected; capture incomplete")
+        })
+    });
+    if result.is_err() {
+        c.failed = true;
+        notice("Cloud recording incomplete: upload unavailable or buffer full. Teams remains the fallback.");
+    }
+    result
+}
+
+pub async fn cloud_finish(transcript: Value, transcription_complete: bool) -> Result<()> {
+    let capture = CLOUD
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Cloud recorder unavailable"))?
+        .take();
+    let Some(mut c) = capture else {
+        return Ok(());
+    };
+    for track in 0..3 {
+        if let Some(segment) = c.segmenters[track].finish()? {
+            if c.sender.send((track, segment)).await.is_err() {
+                c.failed = true;
+                break;
+            }
+        }
+    }
+    drop(c.sender);
+    let parts = match tokio::time::timeout(Duration::from_secs(300), &mut c.task).await {
+        Ok(result) => result.context("Cloud upload worker failed")??,
+        Err(_) => {
+            c.task.abort();
+            anyhow::bail!("Cloud upload drain timed out; capture incomplete");
+        }
+    };
+    ensure!(
+        !c.failed && transcription_complete && !parts[0].is_empty(),
+        "Capture incomplete; remote segments retained, no completion marker published"
+    );
+    let graph = graph::Graph::new(access(&c.settings).await?)?;
+    let manifest = serde_json::json!({"version":1,"capture_id":c.capture,"title":c.title,
+        "recorder":c.settings.profile,"tracks":parts,"transcript":transcript,"source_index":c.source_index,
+        "state":"ready_for_assembly","sample_rate":btbi_core::cloud_audio::RATE});
+    graph
+        .publish_cloud_capture(&c.settings.destination, c.capture, &manifest)
+        .await?;
+    notice("Capture uploaded and verified. Waiting for recording assembly.");
+    Ok(())
+}
+
+pub fn cloud_abort() {
+    if let Ok(mut state) = CLOUD.lock() {
+        if let Some(c) = state.take() {
+            c.task.abort();
+            notice("Capture interrupted; uploaded segments retained as incomplete.");
+        }
+    }
 }

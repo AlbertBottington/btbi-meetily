@@ -70,9 +70,12 @@ export function BtbiUploadSettings() {
     <section className="space-y-5 p-6 bg-white rounded-lg border">
       <h2 className="text-xl font-semibold">BTBI SharePoint uploads</h2>
       <p>
-        Completed meetings upload audio, transcripts and metadata automatically.
-        Originals remain on this computer. Enable “Save recordings” in
-        Recordings before using automatic upload.
+        Enable “Save recordings” to capture audio for SharePoint. Audio uploads
+        during recording without a local audio staging folder.
+        Keep this app open until the capture upload finishes. A processing worker
+        then assembles one recording in SharePoint. If the connection fails or
+        the memory buffer fills, the capture may be incomplete. Keep Teams
+        recording alongside during the pilot.
       </p>
       <details>
         <summary className="cursor-pointer font-medium">

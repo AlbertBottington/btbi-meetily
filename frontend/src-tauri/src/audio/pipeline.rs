@@ -1106,6 +1106,11 @@ impl AudioPipeline {
                         continue;
                     }
 
+                    if crate::btbi::cloud_active() {
+                        if crate::btbi::cloud_audio_at(if chunk.device_type == super::recording_state::DeviceType::Microphone {1} else {2}, &chunk.data, chunk.sample_rate, Some(chunk.timestamp)).is_err() {
+                            self.btbi_pipeline_failed = true;
+                        }
+                    }
                     if let Some((tracks, _)) = self.source_tracks.as_mut() {
                         if tracks.append(chunk.device_type == super::recording_state::DeviceType::Microphone,
                             chunk.timestamp, chunk.sample_rate, &chunk.data).is_err() {

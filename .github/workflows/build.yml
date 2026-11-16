@@ -127,6 +127,11 @@ jobs:
           if ($env:PORTABLE_BUILD_ARGS -match '(?:^|\s)--target(?:=|\s+)([A-Za-z0-9_-]+)') {
             $buildDirectory = "target/$($Matches[1])/$env:PORTABLE_BUILD_PROFILE"
           }
+          # ort-sys 2.0.0-rc.10 copies DLLs to examples/deps without creating
+          # them. Native tests use debug even when the installer uses release.
+          foreach ($directory in @("target/debug", "target/release", $buildDirectory)) {
+            New-Item -ItemType Directory -Force "$directory/examples", "$directory/deps" | Out-Null
+          }
           $configPath = (Join-Path $env:RUNNER_TEMP "tauri.windows-portable.conf.json").Replace('\', '/')
           @{
             build = @{

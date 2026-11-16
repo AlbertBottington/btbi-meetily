@@ -144,6 +144,18 @@ impl RecordingSaver {
         auto_save: bool,
         mut receiver: mpsc::UnboundedReceiver<AudioChunk>,
     ) {
+        if crate::btbi::cloud_active() {
+            self.meeting_folder = None;
+            self.incremental_saver = None;
+            self.accumulation = Some(tokio::spawn(async move {
+                while let Some(chunk) = receiver.recv().await {
+                    crate::btbi::cloud_audio(0, &chunk.data, chunk.sample_rate).map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            }));
+            return;
+        }
+
         if auto_save {
             info!("Initializing incremental audio saver for recording (auto-save ENABLED)");
         } else {
