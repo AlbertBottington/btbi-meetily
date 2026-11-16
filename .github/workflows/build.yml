@@ -771,6 +771,11 @@ jobs:
             target/${{ steps.build-profile.outputs.profile }}/bundle/rpm/*.rpm
           retention-days: 30
 
+      - name: Smoke-test installed BTBI pilot startup
+        if: contains(inputs.platform, 'windows') && inputs.asset-prefix == 'btbi-meetily-pilot'
+        shell: pwsh
+        run: ./.github/smoke-btbi-startup.ps1
+
       - name: Upload artifacts (Windows)
         if: inputs.upload-artifacts && contains(inputs.platform, 'windows')
         uses: actions/upload-artifact@v4
