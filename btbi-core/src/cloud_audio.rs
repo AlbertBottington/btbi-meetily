@@ -14,6 +14,8 @@ pub struct SegmentInfo {
     pub sequence: u32,
     pub samples: u32,
     pub sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_sha256: Option<String>,
 }
 pub struct Segment {
     pub info: SegmentInfo,
@@ -92,6 +94,7 @@ impl Segmenter {
             sequence: self.sequence,
             samples,
             sha256: digest(&wav),
+            index_sha256: None,
         };
         self.sequence = self
             .sequence
@@ -199,5 +202,104 @@ mod tests {
                 "Upload backlog full"
             ))
             .is_err());
+    }
+}
+
+/// Source timing is uploaded with each segment, not accumulated for the meeting.
+/// A callback crossing a boundary is referenced in both segments with its full
+/// original sample interval, so no timestamps are lost at the split.
+pub type TimingRow = (f64, u64, usize);
+pub struct TimedSegment {
+    pub audio: Segment,
+    pub timing: Vec<TimingRow>,
+}
+#[derive(Default)]
+pub struct TimedSegmenter {
+    audio: Segmenter,
+    timing: Vec<TimingRow>,
+    offset: u64,
+}
+impl TimedSegmenter {
+    pub fn push(
+        &mut self,
+        samples: &[f32],
+        rate: u32,
+        timestamp: Option<f64>,
+        mut emit: impl FnMut(TimedSegment) -> Result<()>,
+    ) -> Result<()> {
+        ensure!(
+            self.timing.len() < 40_000,
+            "Source callback rate exceeds timing buffer limit"
+        );
+        let row = if let Some(t) = timestamp {
+            ensure!(t.is_finite() && t >= 0.0, "Invalid source timestamp");
+            Some((t, self.offset, samples.len()))
+        } else {
+            None
+        };
+        if let Some(r) = row {
+            self.timing.push(r);
+        }
+        self.offset += samples.len() as u64;
+        let timing = &mut self.timing;
+        self.audio.push(samples, rate, |audio| {
+            let rows = std::mem::take(timing);
+            emit(TimedSegment {
+                audio,
+                timing: rows,
+            })?;
+            if let Some(r) = row {
+                timing.push(r);
+            }
+            Ok(())
+        })?;
+        if self.audio.pcm.is_empty() {
+            self.timing.clear();
+        }
+        Ok(())
+    }
+    pub fn finish(&mut self) -> Result<Option<TimedSegment>> {
+        Ok(self.audio.finish()?.map(|audio| TimedSegment {
+            audio,
+            timing: std::mem::take(&mut self.timing),
+        }))
+    }
+}
+#[cfg(test)]
+mod timing_tests {
+    use super::*;
+    #[test]
+    fn timing_drains_per_segment_and_preserves_crossing_callback() {
+        let mut s = TimedSegmenter::default();
+        let mut output = Vec::new();
+        s.push(&vec![0.0; SEGMENT_SAMPLES + 12], RATE, Some(3.5), |p| {
+            output.push(p);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(s.timing.len(), 1);
+        output.push(s.finish().unwrap().unwrap());
+        assert!(s.timing.is_empty());
+        assert_eq!(output[0].timing, output[1].timing);
+        assert_eq!(output[1].timing[0], (3.5, 0, SEGMENT_SAMPLES + 12));
+        assert_eq!(output[1].audio.info.samples, 12);
+    }
+    #[test]
+    fn exact_boundary_does_not_retain_old_timing() {
+        let mut s = TimedSegmenter::default();
+        for n in 0..3 {
+            s.push(
+                &vec![0.0; SEGMENT_SAMPLES],
+                RATE,
+                Some(n as f64 * 30.0),
+                |p| {
+                    assert_eq!(p.timing.len(), 1);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert!(s.timing.is_empty());
+        }
+        assert!(s.finish().unwrap().is_none());
     }
 }

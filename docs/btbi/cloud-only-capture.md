@@ -33,8 +33,8 @@ page memory or include it in crash dumps.
 
 The BTBI recorder requires SharePoint sign-in and Save recordings enabled.
 Its mixed-audio saver bypasses the local folder/checkpoint path. The source
-pipeline feeds separate microphone and system segmenters plus a bounded timing
-index. Twelve pending segments are allowed in RAM; overflow or upload failure
+pipeline feeds separate microphone and system segmenters. Timing indexes upload
+with each segment rather than accumulating for the entire meeting. Twelve pending segments are allowed in RAM; overflow or upload failure
 marks the capture incomplete. Uploads retry twice, with bounded delays. A
 completion manifest is published only after audio drains and transcription
 completes. Original Meetily files and old upload queues are not deleted.

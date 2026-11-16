@@ -142,6 +142,24 @@ impl Graph {
         )
         .await
     }
+    pub async fn upload_cloud_index(
+        &self,
+        d: &Destination,
+        capture: Uuid,
+        track: usize,
+        sequence: u32,
+        rows: &[cloud_audio::TimingRow],
+    ) -> Result<String> {
+        ensure!(track == 1 || track == 2, "Invalid source track");
+        let bytes = serde_json::to_vec(rows)?;
+        ensure!(bytes.len() <= 10 * 1024 * 1024, "Timing segment too large");
+        self.put_memory_verified(
+            &item(d, capture, &format!("source-{track}-{sequence:08}.json")),
+            &bytes,
+        )
+        .await?;
+        Ok(cloud_audio::digest(&bytes))
+    }
     pub async fn publish_cloud_capture(
         &self,
         d: &Destination,
@@ -327,6 +345,25 @@ impl Graph {
         for parts in &tracks {
             if !parts.is_empty() {
                 cloud_audio::assembly_header(parts)?;
+            }
+        }
+        for (track, parts) in tracks.iter().enumerate().skip(1) {
+            for p in parts {
+                let hash = p
+                    .index_sha256
+                    .as_deref()
+                    .context("Missing source timing checksum")?;
+                let value = self
+                    .cloud_json(&item(
+                        d,
+                        capture,
+                        &format!("source-{track}-{:08}.json", p.sequence),
+                    ))
+                    .await?;
+                ensure!(
+                    cloud_audio::digest(&serde_json::to_vec(&value)?) == hash,
+                    "Source timing checksum mismatch"
+                );
             }
         }
         ensure!(

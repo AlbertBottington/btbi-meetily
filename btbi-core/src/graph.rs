@@ -771,7 +771,18 @@ mod transport_tests {
             .upload_cloud_track_segment(&d, capture, 0, &part)
             .await
             .unwrap();
-        let manifest = json!({"version":1,"capture_id":capture,"state":"ready_for_assembly","tracks":[[part.info],[],[]],"transcript":{"segments":[{"text":"final words"}]}});
+        graph
+            .upload_cloud_track_segment(&d, capture, 1, &part)
+            .await
+            .unwrap();
+        let mut source_info = part.info.clone();
+        source_info.index_sha256 = Some(
+            graph
+                .upload_cloud_index(&d, capture, 1, 0, &[(0.25, 0, 1000)])
+                .await
+                .unwrap(),
+        );
+        let manifest = json!({"version":1,"capture_id":capture,"state":"ready_for_assembly","tracks":[[part.info],[source_info],[]],"transcript":{"segments":[{"text":"final words"}]}});
         graph
             .publish_cloud_capture(&d, capture, &manifest)
             .await
@@ -801,7 +812,10 @@ mod transport_tests {
         graph.process_cloud_capture(&d, capture).await.unwrap();
         graph.process_cloud_capture(&d, capture).await.unwrap();
         let state = remote.lock().unwrap();
-        assert_eq!(state.deletes, 1);
+        assert_eq!(state.deletes, 2);
+        assert!(state
+            .files
+            .contains_key(&format!("{capture}/source-1-00000000.json")));
         assert!(!state.auth_leaked);
         drop(state);
         server.abort();
