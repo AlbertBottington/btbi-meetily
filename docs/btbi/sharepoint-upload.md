@@ -18,8 +18,10 @@ do not silently expand scopes if the tenant requires more.
 Settings → SharePoint → One-time administrator setup accepts tenant ID,
 application/client ID, document-library drive ID and destination-folder item ID.
 Sign in with each recorder's own BTBI account. The app checks the destination is
-a folder, uses the signed-in user ID, and stores refresh credentials in the OS
-credential store. Authentication is Microsoft device-code flow, not a custom
+a folder and uses the signed-in user ID. On Windows, refresh credentials are
+stored in user-scoped DPAPI-encrypted files under the Tauri app-data directory
+(`btbi/tokens/`), avoiding Credential Manager's password size limit. macOS keeps
+using Keychain. Access tokens stay in memory. Authentication is Microsoft device-code flow, not a custom
 password form. Tenant policy may block this flow; that requires an explicit
 identity-design decision rather than embedding secrets or bypassing policy.
 
@@ -68,7 +70,7 @@ channel until BTBI signing is configured. Do not bypass managed-PC restrictions.
 4. Test revoked credentials, expired upload sessions, throttling, disk full,
    transcription errors/timeouts, microphone disconnect and changed account.
 5. Check long-recording timestamps/pause gaps, original-file retention, Windows
-   Credential Manager, installer identity and disabled upstream updates.
+   DPAPI-protected token storage, installer identity and disabled upstream updates.
 
 Core tests are run independently with `cargo test --manifest-path
 btbi-core/Cargo.toml`. Full app compilation, Windows installer and live recording/
@@ -97,3 +99,22 @@ included.
 
 Protocol references: [resumable uploads](https://learn.microsoft.com/en-us/graph/api/driveitem-createuploadsession?view=graph-rest-1.0)
 and [device authorization](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-device-code).
+
+## Windows sign-in storage repair
+
+- Only ciphertext reaches the token file or its same-directory replacement file.
+  File names and DPAPI entropy bind each token to tenant, client and recorder ID.
+  Protection uses the current Windows user, not machine-wide DPAPI.
+- Refresh rotation replaces the file atomically after flushing it; a failed write
+  leaves the prior credential intact. A smaller legacy credential migrates only
+  after protected storage succeeds. Corrupt protected files fail closed.
+- Sign out deletes protected and legacy credentials, clears the profile and pauses
+  uploads; it preserves destination settings and queued captures. Stop recording
+  before signing out. Sign out before changing account or destination.
+- Save setup shows confirmation. Authentication failures display a sign-in error.
+- Windows regressions: oversized token round-trip, fresh-process read, rotation,
+  blocked replacement, corrupt/cross-account ciphertext, migration and deletion.
+  Run `cargo test --manifest-path btbi-core/Cargo.toml --features token-store --locked`
+  on Windows. Cross-compilation alone does not prove DPAPI runtime behavior.
+- Acceptance remains a real Windows sign-in, restart and SharePoint test upload.
+  Do not treat the browser's Microsoft success page as app-side persistence proof.

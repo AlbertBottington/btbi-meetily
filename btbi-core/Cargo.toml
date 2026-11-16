@@ -17,8 +17,12 @@ keyring = { version = "3", features = ["apple-native", "windows-native"], option
 
 [features]
 worker = ["dep:keyring"]
+token-store = ["dep:keyring"]
 
 [[bin]]
 name = "btbi-cloud-worker"
 path = "src/bin/btbi-cloud-worker.rs"
 required-features = ["worker"]
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }

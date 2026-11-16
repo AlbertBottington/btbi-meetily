@@ -1,4 +1,4 @@
-//! BTBI upload orchestration. Tokens live only in the OS credential store.
+//! BTBI upload orchestration. Tokens use OS-protected storage.
 use anyhow::{ensure, Context, Result};
 use btbi_core::{
     graph::{self, Profile},
@@ -16,6 +16,7 @@ use tokio::sync::Mutex;
 
 static ROOT: OnceLock<PathBuf> = OnceLock::new();
 static OPERATION: Mutex<()> = Mutex::const_new(());
+static TOKEN_ACCESS: Mutex<()> = Mutex::const_new(());
 static SIGNING_IN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static NOTICE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 #[derive(Clone, Serialize, Deserialize)]
@@ -35,15 +36,14 @@ fn settings() -> Result<Settings> {
 fn save(s: &Settings) -> Result<()> {
     queue::atomic_json(&root()?.join("settings.json"), s)
 }
-fn credentials(s: &Settings) -> Result<keyring::Entry> {
+fn credentials(s: &Settings) -> Result<btbi_core::tokens::TokenStore> {
     let p = s.profile.as_ref().context("Sign in to Microsoft")?;
-    Ok(keyring::Entry::new(
-        "BTBI Meetily",
-        &format!(
-            "{}:{}:{}",
-            s.destination.tenant_id, s.destination.client_id, p.id
-        ),
-    )?)
+    btbi_core::tokens::TokenStore::new(
+        root()?,
+        &s.destination.tenant_id,
+        &s.destination.client_id,
+        &p.id,
+    )
 }
 fn notice(s: &str) {
     if let Ok(mut n) = NOTICE.lock() {
@@ -142,14 +142,15 @@ pub async fn enqueue(folder: &Path, meeting_id: &str, _transcript: Value) -> Res
     Ok(())
 }
 async fn access(s: &Settings) -> Result<String> {
+    let _token_guard = TOKEN_ACCESS.lock().await;
     let entry = credentials(s)?;
     let refresh = entry
-        .get_password()
+        .get()
         .map_err(|_| anyhow::anyhow!("Microsoft sign-in required"))?;
     let token = graph::refresh(&s.destination, &refresh).await?;
     if let Some(r) = token.refresh_token {
         entry
-            .set_password(&r)
+            .set(&r)
             .map_err(|_| anyhow::anyhow!("Could not protect Microsoft token"))?;
     }
     let profile = graph::profile(&token.access_token).await?;
@@ -237,8 +238,17 @@ pub async fn btbi_configure(destination: Destination, enabled: bool) -> Result<(
     if crate::audio::recording_commands::is_recording().await || cloud_active() {
         return Err("Stop recording before changing upload settings".into());
     }
+    if SIGNING_IN.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("Wait for Microsoft sign-in to finish".into());
+    }
     destination.validate().map_err(message)?;
     let old = settings().ok();
+    if old
+        .as_ref()
+        .is_some_and(|s| s.profile.is_some() && s.destination != destination)
+    {
+        return Err("Sign out before changing the SharePoint destination".into());
+    }
     let profile = old
         .filter(|s| s.destination == destination)
         .and_then(|s| s.profile);
@@ -250,10 +260,35 @@ pub async fn btbi_configure(destination: Destination, enabled: bool) -> Result<(
         destination,
         profile,
     })
-    .map_err(message)
+    .map_err(message)?;
+    notice("Setup saved.");
+    Ok(())
+}
+#[tauri::command]
+pub async fn btbi_signout() -> Result<(), String> {
+    let _guard = OPERATION.lock().await;
+    if SIGNING_IN.load(std::sync::atomic::Ordering::SeqCst)
+        || crate::audio::recording_commands::is_recording().await
+        || cloud_active()
+    {
+        return Err("Stop recording and wait for sign-in to finish before signing out".into());
+    }
+    let _token_guard = TOKEN_ACCESS.lock().await;
+    let mut s = settings().map_err(message)?;
+    if s.profile.is_some() {
+        credentials(&s)
+            .and_then(|store| store.delete())
+            .map_err(message)?;
+    }
+    s.profile = None;
+    s.enabled = false;
+    save(&s).map_err(message)?;
+    notice("Signed out. Automatic upload paused.");
+    Ok(())
 }
 #[tauri::command]
 pub async fn btbi_begin_signin() -> Result<Value, String> {
+    let guard = OPERATION.lock().await;
     if crate::audio::recording_commands::is_recording().await || cloud_active() {
         return Err("Stop recording before changing the Microsoft account".into());
     }
@@ -261,17 +296,26 @@ pub async fn btbi_begin_signin() -> Result<Value, String> {
     if SIGNING_IN.swap(true, Ordering::SeqCst) {
         return Err("Sign-in already in progress".into());
     }
+    notice("Waiting for Microsoft sign-in.");
     let s = match settings() {
         Ok(s) => s,
         Err(_) => {
             SIGNING_IN.store(false, Ordering::SeqCst);
+            notice("Save setup before signing in.");
             return Err("Configure the Microsoft app and SharePoint folder first".into());
         }
     };
+    if s.profile.is_some() {
+        SIGNING_IN.store(false, Ordering::SeqCst);
+        notice("Sign out before signing in to another Microsoft account.");
+        return Err("Sign out before signing in again".into());
+    }
+    drop(guard);
     let code = match graph::begin(&s.destination).await {
         Ok(c) => c,
         Err(e) => {
             SIGNING_IN.store(false, Ordering::SeqCst);
+            notice("Could not start Microsoft sign-in. Check the error and try again.");
             return Err(message(e));
         }
     };
@@ -297,12 +341,13 @@ pub async fn btbi_begin_signin() -> Result<Value, String> {
                         let mut saved = settings()?;
                         saved.profile = Some(profile);
                         saved.enabled = true;
-                        credentials(&saved)?.set_password(
+                        let _token_guard = TOKEN_ACCESS.lock().await;
+                        credentials(&saved)?.set(
                             token
                                 .refresh_token
                                 .as_deref()
                                 .context("Microsoft did not return offline access")?,
-                        )?;
+                        ).context("Microsoft accepted sign-in, but this app could not securely save it. Check app storage access and try again")?;
                         save(&saved)?;
                         notice("Signed in. Automatic upload enabled.");
                         return Ok(());
@@ -316,7 +361,7 @@ pub async fn btbi_begin_signin() -> Result<Value, String> {
         }
         .await;
         if let Err(e) = result {
-            notice(&e.to_string());
+            notice(&format!("Sign-in failed: {}", e));
         }
         SIGNING_IN.store(false, Ordering::SeqCst);
     });

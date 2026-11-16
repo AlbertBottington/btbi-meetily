@@ -60,6 +60,7 @@ export function BtbiUploadSettings() {
     setError("");
     try {
       await action();
+      setStatus(await invoke<Status>("btbi_status"));
     } catch (e) {
       setError(String(e));
     } finally {
@@ -128,13 +129,22 @@ export function BtbiUploadSettings() {
       <div className="flex gap-3">
         <button
           className="bg-blue-600 text-white rounded px-4 py-2 disabled:opacity-50"
-          disabled={busy || status?.signing_in}
+          disabled={busy || status?.signing_in || !!status?.settings?.profile}
           onClick={() =>
             run(async () => setCode(await invoke("btbi_begin_signin")))
           }
         >
           Sign in to Microsoft
         </button>
+        {status?.settings?.profile && (
+          <button
+            className="border rounded px-4 py-2"
+            disabled={busy || status?.signing_in}
+            onClick={() => run(async () => { await invoke("btbi_signout"); setCode(undefined); })}
+          >
+            Sign out
+          </button>
+        )}
         {status?.settings?.profile && (
           <button
             className="border rounded px-4 py-2"

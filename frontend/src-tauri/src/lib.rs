@@ -731,7 +731,7 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            btbi::btbi_status, btbi::btbi_configure, btbi::btbi_begin_signin, btbi::btbi_retry,
+            btbi::btbi_status, btbi::btbi_configure, btbi::btbi_begin_signin, btbi::btbi_signout, btbi::btbi_retry,
             start_recording,
             stop_recording,
             is_recording,
